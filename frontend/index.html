@@ -1,0 +1,151 @@
+<!-- frontend/index.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Signals Dashboard (MVP)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 18px auto; padding: 10px; }
+    .card { border: 1px solid #ddd; padding: 12px; border-radius: 6px; margin-bottom: 12px; }
+    .controls { display:flex; gap:8px; margin-bottom:12px; }
+    .signal { display:flex; justify-content:space-between; gap:8px; padding:8px; border-bottom:1px dashed #eee; }
+    .meta { color:#555; font-size:0.9em; }
+    .buy { color: green; font-weight:bold }
+    .sell { color: red; font-weight:bold }
+  </style>
+</head>
+<body>
+  <h2>Signals Dashboard (MVP)</h2>
+
+  <div class="card" id="auth-card">
+    <div id="auth-forms">
+      <input id="email" placeholder="email" />
+      <input id="password" placeholder="password" type="password" />
+      <button id="btn-register">Register</button>
+      <button id="btn-login">Login</button>
+    </div>
+    <div id="user-info" style="display:none;">
+      <div id="me"></div>
+      <button id="btn-logout">Logout</button>
+    </div>
+    <div id="auth-msg" class="meta"></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h3>Live Signals</h3>
+      <div class="meta">Auto-refresh every 5s</div>
+    </div>
+    <div id="signals-list"></div>
+    <div id="signals-msg" class="meta"></div>
+  </div>
+
+<script>
+const API_BASE = (location.hostname === "localhost" ? "http://localhost:5000" : (location.origin));
+let token = localStorage.getItem("auth_token");
+
+function setAuthUI() {
+  if (token) {
+    document.getElementById("auth-forms").style.display = "none";
+    document.getElementById("user-info").style.display = "block";
+    fetch(API_BASE + "/me", { headers: { "Authorization": "Bearer " + token }})
+      .then(r => r.json()).then(j => {
+        if (j.email) {
+          document.getElementById("me").innerText = `${j.email} — Trial active: ${j.trial_active} (expires ${j.trial_expires})`;
+        } else if (j.error) {
+          document.getElementById("auth-msg").innerText = JSON.stringify(j);
+        }
+      }).catch(e => console.log(e));
+  } else {
+    document.getElementById("auth-forms").style.display = "block";
+    document.getElementById("user-info").style.display = "none";
+  }
+}
+
+document.getElementById("btn-register").onclick = () => {
+  const email = document.getElementById("email").value;
+  const password = document.getElementById("password").value;
+  fetch(API_BASE + "/register", {
+    method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({email, password})
+  }).then(r => r.json()).then(j => {
+    if (j.token) {
+      token = j.token;
+      localStorage.setItem("auth_token", token);
+      setAuthUI();
+    } else {
+      document.getElementById("auth-msg").innerText = JSON.stringify(j);
+    }
+  });
+};
+
+document.getElementById("btn-login").onclick = () => {
+  const email = document.getElementById("email").value;
+  const password = document.getElementById("password").value;
+  fetch(API_BASE + "/login", {
+    method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({email, password})
+  }).then(r => r.json()).then(j => {
+    if (j.token) {
+      token = j.token;
+      localStorage.setItem("auth_token", token);
+      setAuthUI();
+    } else {
+      document.getElementById("auth-msg").innerText = JSON.stringify(j);
+    }
+  });
+};
+
+document.getElementById("btn-logout").onclick = () => {
+  token = null;
+  localStorage.removeItem("auth_token");
+  setAuthUI();
+};
+
+async function loadSignals() {
+  const el = document.getElementById("signals-list");
+  el.innerHTML = "";
+  document.getElementById("signals-msg").innerText = "";
+  if (!token) {
+    document.getElementById("signals-msg").innerText = "Please log in to view signals (5-day free trial).";
+    return;
+  }
+  try {
+    const res = await fetch(API_BASE + "/signals", { headers: { "Authorization": "Bearer " + token }});
+    if (res.status === 402) {
+      const j = await res.json();
+      document.getElementById("signals-msg").innerText = "Trial expired: " + j.trial_expires;
+      return;
+    }
+    const j = await res.json();
+    if (!j.signals) {
+      document.getElementById("signals-msg").innerText = JSON.stringify(j);
+      return;
+    }
+    if (j.signals.length === 0) {
+      el.innerHTML = "<div class='meta'>No signals yet</div>";
+      return;
+    }
+    j.signals.forEach(s => {
+      const div = document.createElement("div");
+      div.className = "signal";
+      div.innerHTML = `<div>
+          <div><strong>${s.symbol}</strong> <span class="meta">(${s.strategy||''})</span></div>
+          <div class="meta">${s.time} • conf:${s.confidence||''} • ${s.meta||''}</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="${s.side==='buy'?'buy':'sell'}">${s.side.toUpperCase()}</div>
+          <div>${s.entry.toFixed(5)}</div>
+        </div>`;
+      el.appendChild(div);
+    });
+  } catch (e) {
+    document.getElementById("signals-msg").innerText = "Failed to load signals: " + e.message;
+  }
+}
+
+setAuthUI();
+loadSignals();
+setInterval(loadSignals, 5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,38 @@
+.env
+*.pyc
+__pycache__/
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env/
+.venv/
+
+# Logs & data
+*.log
+*.csv
+*.txt
+*.json
+
+# Trade history & performance reports
+rejected_signals_log.csv
+trades_history_local.csv
+
+# Jupyter & notebooks
+.ipynb_checkpoints/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# MT5 specific
+*.ex5
+*.ex4
+*.mq5
+*.mq4
+MQL5/
+MQL4/
