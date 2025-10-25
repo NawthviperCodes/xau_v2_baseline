@@ -1,5 +1,0 @@
-MetaTrader5==5.0.45
-pandas>=2.0.0
-ta>=0.10.2
-pytz>=2023.3
-tk
