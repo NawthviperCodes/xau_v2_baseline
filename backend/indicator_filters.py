@@ -13,14 +13,21 @@ def macd_cross(macd_line, signal_line):
 
 def rsi_filter(rsi_values, side):
     """
-    Returns True if RSI confirms the trade direction.
-    For buy: RSI < 30 (oversold) or turning up.
-    For sell: RSI > 70 (overbought) or turning down.
+    Returns True if RSI confirms the trade direction (momentum).
+    For buy: RSI > 50 (bullish momentum).
+    For sell: RSI < 50 (bearish momentum).
     """
+    if len(rsi_values) < 1:
+        return False
+        
+    last_rsi = rsi_values[-1]
+
     if side == "buy":
-        return rsi_values[-1] < 30 or (rsi_values[-2] < rsi_values[-1])
-    else:
-        return rsi_values[-1] > 70 or (rsi_values[-2] > rsi_values[-1])
+        # Price is in a bullish regime
+        return last_rsi > 50
+    else: # sell
+        # Price is in a bearish regime
+        return last_rsi < 50
 
 def vwap_filter(price, vwap_value, side):
     """

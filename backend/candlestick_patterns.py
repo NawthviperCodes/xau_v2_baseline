@@ -33,6 +33,46 @@ def is_bullish_engulfing(o1, h1, l1, c1, o2, h2, l2, c2, require_wick=False):
         return (h2 > h1) and (l2 < l1)
     return True
 
+def is_inside_bar(o1, h1, l1, c1, o2, h2, l2, c2):
+    """
+    [cite_start]Checks for an Inside Bar (Harami)[cite: 445].
+    - c1 is the "mother", c2 is the "baby".
+    - Candle 2 High < Candle 1 High
+    - Candle 2 Low > Candle 1 Low
+    """
+    if None in [h1, l1, h2, l2]:
+        return False
+    
+    # Check that the baby (c2) is fully contained within the mother's (c1) wicks
+    return (h2 < h1) and (l2 > l1)
+
+
+def is_inside_bar_false_breakout(o1, h1, l1, c1, o2, h2, l2, c2):
+    """
+    [cite_start]Checks for an Inside Bar False Breakout (Fakeout / Stop Hunt)[cite: 1498, 1500].
+    - c1 is the "mother", c2 is the "fakeout" bar.
+    - c2 body must close back inside c1's range (High/Low).
+    - c2 must have a long wick poking *outside* c1's range.
+    
+    Returns: 'buy' (bullish fakeout), 'sell' (bearish fakeout), or None
+    """
+    if None in [o1, h1, l1, c1, o2, h2, l2, c2]:
+        return None
+
+    mother_high = h1
+    mother_low = l1
+    
+    # [cite_start]Check for a Bearish Fakeout (Bull Trap) [cite: 1532]
+    # c2 pokes *above* mother_high but *closes* back inside the range
+    if (h2 > mother_high) and (c2 < mother_high):
+        return "sell"
+        
+    # Check for a Bullish Fakeout (Bear Trap)
+    # c2 pokes *below* mother_low but *closes* back inside the range
+    if (l2 < mother_low) and (c2 > mother_low):
+        return "buy"
+    
+    return None
 
 # --- Bearish Engulfing ---
 def is_bearish_engulfing(o1, h1, l1, c1, o2, h2, l2, c2, require_wick=False):

@@ -39,6 +39,7 @@ from ta.trend import MACD, ADXIndicator
 from news_filter_te import check_upcoming_high_impact
 from ta.momentum import RSIIndicator
 from ta.volume import VolumeWeightedAveragePrice
+from ta.volatility import BollingerBands
 import csv, os, threading, traceback
 from collections import defaultdict
 import inspect
@@ -635,9 +636,15 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
 
     # --- Fetch H1 and detect zones
     h1_df = get_data(symbol, TIMEFRAME_ZONE, ZONE_LOOKBACK)
-    if h1_df.empty:
-        send_info(f"[ERROR] {symbol} H1 unavailable.")
+    if h1_df.empty or len(h1_df) < 3: # Ensure we have enough data for the range
+        send_info(f"[ERROR] {symbol} H1 unavailable or insufficient data.")
         return
+
+    # === NEW: Get HTF (H1) Candle Range for the MTF CRT Strategy ===
+    last_completed_h1_candle = h1_df.iloc[-2] # Use [-2] for the last *closed* candle
+    htf_high = last_completed_h1_candle['high']
+    htf_low = last_completed_h1_candle['low']
+    # ==============================================================
 
     demand_zones, supply_zones = detect_zones(h1_df)
     fast_demand, fast_supply = detect_fast_zones(h1_df)
@@ -647,69 +654,98 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
         send_info(f"[ERROR] Not enough H1 data for {symbol}")
         return
 
+    strategy_to_run = "trend_follow"  # Default strategy
     try:
         adx = ADXIndicator(high=h1_df['high'], low=h1_df['low'], close=h1_df['close'], window=14)
         adx_value = adx.adx().iloc[-1]
-
-        adaptive_adx = adaptive_adx_threshold(h1_df, lookback=200, percentile=50)  # median instead of 70th
-        min_floor = 15.0  # absolute minimum required ADX
-
-        # softer filter: require ADX >= max(median, 15)
+        adaptive_adx = adaptive_adx_threshold(h1_df, lookback=200, percentile=50)
+        min_floor = 15.0
         required_adx = max(adaptive_adx, min_floor)
-
+        
         if adx_value < required_adx:
-            send_info(f"[FILTER] {symbol} ADX={adx_value:.2f} < required {required_adx:.2f} → Range detected, skip trading.")
-            return
+            send_info(f"[FILTER] {symbol} ADX={adx_value:.2f} < required {required_adx:.2f} → Switching to Ranging Strategy.")
+            strategy_to_run = "ranging"  # <-- CHANGE: Switch strategy, don't return
     except Exception as e:
         send_info(f"[WARN] ADX calculation failed: {e}")
+        
+    # === NEW: FIBONACCI CALCULATION (Bible p. 96, 100) ===
+    fibo_zone = None
+    try:
+        if trend == "uptrend":
+            low_point = h1_df['low'].rolling(20).min().iloc[-1]
+            high_point = h1_df['high'].iloc[-1]
+            diff = high_point - low_point
+            fibo_zone = (high_point - (diff * 0.618), high_point - (diff * 0.50))
+        elif trend == "downtrend":
+            high_point = h1_df['high'].rolling(20).max().iloc[-1]
+            low_point = h1_df['low'].iloc[-1]
+            diff = high_point - low_point
+            fibo_zone = (high_point - (diff * 0.50), high_point - (diff * 0.618))
+    except Exception as e:
+        send_info(f"[WARN] Fibo calc failed: {e}")
+        fibo_zone = None
 
-    # --- News filter ---
     if check_upcoming_high_impact(symbol, minutes_ahead=60):
         send_info(f"[NEWS FILTER] {symbol} → High-impact news in next 60min, skip trading.")
         return
 
-    # --- Session filter ---
-    # NEW: Rely on symbol-specific session check for better quality control
     if not is_in_active_session(symbol):
         send_info(f"[SESSION FILTER] {symbol} → Not in optimal trading session, skip trading.")
-        # still check for exits
         try:
             check_closed_trades(symbol)
         except Exception as e:
             send_info(f"[WARN] check_closed_trades failed in sleep mode: {e}")
         return
 
-    # --- Fetch M1 and M5
+    # === DATA FETCH & VALIDATION (M1 and M5) ===
     m1_df = get_data(symbol, TIMEFRAME_ENTRY, 200)
-    if len(m1_df) < 35:
-        send_info(f"[ERROR] Not enough M1 candles for {symbol}")
+    if len(m1_df) < 35: # Need 35 for indicators
+        send_info(f"[ERROR] Not enough M1 candles for {symbol} (need 35, got {len(m1_df)})")
         return
-
+    
     m5_df = get_data(symbol, TIMEFRAME_CONFIRM, 60)
     m5_context = {}
-    if not m5_df.empty and len(m5_df) >= 35:
+    
+    # ✅ We need at least 5 candles from M5 for pattern detection (e.g., rectangle)
+    if m5_df.empty or len(m5_df) < 5:
+        send_info(f"[ERROR] Not enough M5 candles for {symbol} (need 5, got {len(m5_df)}). Skipping pattern check.")
+        return # Hard exit if we can't check patterns
+    
+        # === NEW: BOLLINGER BANDS CALCULATION (Bible p. 106) ===
+    bb_zones = None
+    if strategy_to_run == "ranging" and not m5_df.empty and len(m5_df) >= 20:
+        try:
+            bb = BollingerBands(close=m5_df['close'], window=20, window_dev=2)
+            bb_high = bb.bollinger_hband().iloc[-1]
+            bb_low = bb.bollinger_lband().iloc[-1]
+            bb_zones = { "supply": bb_high, "demand": bb_low }
+        except Exception:
+            bb_zones = None
+        
+    if len(m5_df) >= 35: # We have enough for context indicators
         try:
             m5_context['trend'] = calculate_trend(m5_df)
             m5_context['macd'] = MACD(close=m5_df['close']).macd().dropna().values
             m5_context['rsi'] = RSIIndicator(close=m5_df['close']).rsi().dropna().values
         except Exception as e:
-            send_info(f"[WARN] M5 context failed: {e}")
+            send_info(f"[WARN] M5 context indicators failed: {e}")
             m5_context = {}
+    # ===============================================
 
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         send_info(f"[ERROR] No tick data for {symbol}.")
         return
-
     price = float(tick.bid)
+
     sinfo = mt5.symbol_info(symbol)
     if sinfo is None:
         send_info(f"[ERROR] symbol_info failed for {symbol}.")
         return
     point = sinfo.point
 
-    # --- Indicators on M1
     try:
+        # M1 indicators (still useful for CRT/aggressive filters)
         macd_calc = MACD(close=m1_df['close'])
         macd_line = macd_calc.macd().dropna().values
         macd_signal = macd_calc.macd_signal().dropna().values
@@ -719,7 +755,7 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
         ).vwap.iloc[-1]
         atr = AverageTrueRange(high=m1_df['high'], low=m1_df['low'], close=m1_df['close']).average_true_range().iloc[-1]
     except Exception as e:
-        send_info(f"[WARN] Indicator calculation failed: {e}")
+        send_info(f"[WARN] M1 Indicator calculation failed: {e}")
         macd_line = macd_signal = rsi_values = vwap_value = atr = None
 
     MIN_LOT, MAX_LOT, LOT_STEP = get_lot_constraints(symbol)
@@ -727,7 +763,6 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
     CHECK_RANGE = 300 * point
     lot_size = max(MIN_LOT, fixed_lot if fixed_lot else MIN_LOT)
 
-    # --- Decision engine: strict + aggressive
     try:
         strict_signals, _ = run_trade_decision_engine(
             symbol=symbol,
@@ -736,7 +771,11 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             trend=trend,
             demand_zones=demand_zones,
             supply_zones=supply_zones,
-            last3_candles=m1_df.iloc[-4:-1],
+            
+            # ✅ UPDATED: Pass M1 and M5 candles separately
+            m1_candles_for_crt=m1_df.iloc[-3:],       # Pass last 3 M1 candles
+            m5_candles_for_patterns=m5_df.iloc[-5:],  # Pass last 5 M5 candles
+            
             active_trades=active_trades,
             zone_touch_counts=zone_touch_counts,
             SL_BUFFER=SL_BUFFER,
@@ -750,7 +789,12 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             rsi=rsi_values,
             vwap=vwap_value,
             atr=atr,
-            m5_context=m5_context
+            m5_context=m5_context,
+            htf_high=htf_high,  # Pass the new H1 high
+            htf_low=htf_low,      # Pass the new H1 low
+            last_closed_h1=last_completed_h1_candle, 
+            fibo_zone=fibo_zone,                      
+            bollinger_bands=bb_zones     
         )
     except Exception as e:
         send_info(f"[WARN] trade_decision_engine (strict) raised: {e}\n{traceback.format_exc()}")
@@ -764,7 +808,11 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             trend=trend,
             demand_zones=fast_demand,
             supply_zones=fast_supply,
-            last3_candles=m1_df.iloc[-4:-1],
+            
+            # ✅ UPDATED: Pass M1 and M5 candles separately
+            m1_candles_for_crt=m1_df.iloc[-3:],       # Pass last 3 M1 candles
+            m5_candles_for_patterns=m5_df.iloc[-5:],  # Pass last 5 M5 candles
+
             active_trades=active_trades,
             zone_touch_counts=zone_touch_counts,
             SL_BUFFER=SL_BUFFER,
@@ -778,7 +826,12 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             rsi=rsi_values,
             vwap=vwap_value,
             atr=atr,
-            m5_context=m5_context
+            m5_context=m5_context,
+            htf_high=htf_high, # Pass the new H1 high
+            htf_low=htf_low,     # Pass the new H1 low
+            last_closed_h1=last_completed_h1_candle,  # <--- ADDED
+            fibo_zone=fibo_zone,                      # <--- ADDED
+            bollinger_bands=bb_zones     
         )
     except Exception as e:
         send_info(f"[WARN] trade_decision_engine (aggressive) raised: {e}\n{traceback.format_exc()}")
@@ -786,7 +839,6 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
 
     print_detected_zones(symbol, demand_zones, supply_zones, fast_demand, fast_supply)
 
-    # 1️⃣  Prefer strict signals outright if present
     if strict_signals:
         signals = list(strict_signals)
     elif aggressive_signals:
@@ -794,26 +846,17 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
     else:
         signals = []
 
-    # 2️⃣  Sort by confidence (highest first)
     signals = sorted(signals, key=lambda s: float(s.get("confidence", 0.0)), reverse=True)
 
-    # 3️⃣  Remove exact duplicates (same side/entry/sl/tp)
     unique, seen = [], set()
     for s in signals:
-        key = (
-            s.get("side"),
-            round(s.get("entry", 0), 5),
-            round(s.get("sl", 0), 5),
-            round(s.get("tp", 0), 5),
-        )
+        key = (s.get("side"), round(s.get("entry", 0), 5), round(s.get("sl", 0), 5), round(s.get("tp", 0), 5))
         if key not in seen:
             unique.append(s)
             seen.add(key)
     signals = unique
 
-    # 4️⃣  If both BUY & SELL remain, keep only the strongest confidence
-    sides = {s.get("side") for s in signals}
-    if "buy" in sides and "sell" in sides:
+    if len({s.get("side") for s in signals}) > 1:
         strongest = max(signals, key=lambda s: s.get("confidence", 0))
         signals = [strongest]
 

@@ -1,7 +1,13 @@
 # === trade_decision_engine.py (Probability-based candlestick + indicator confluence + CRT)
 # Merged & updated: calibrated confidences, hard rejection for pattern/zone mismatch,
 # fixes for NoneType subscripting, CRT behavior preserved (filter-only for strict/trend_follow, override for aggressive).
-
+#
+# Updates:
+# - Added Inside Bar and Inside Bar False Breakout detection
+# - compute_candlestick_confidence now accepts last_closed_h1 (H1 safety filter)
+# - run_trade_decision_engine now accepts last_closed_h1, fibo_zone, bollinger_bands
+# - Fibonacci confluence boost and Bollinger Bands ranging filter integrated
+#
 from datetime import datetime
 from telegram_notifier import send_telegram_message
 from candlestick_patterns import (
@@ -12,7 +18,9 @@ from candlestick_patterns import (
     is_morning_star,
     is_evening_star,
     is_bullish_rectangle,
-    is_bearish_rectangle
+    is_bearish_rectangle,
+    is_inside_bar,                 # <--- ADDED
+    is_inside_bar_false_breakout   # <--- ADDED
 )
 from indicator_filters import macd_cross, rsi_filter, vwap_filter  # keep for compatibility
 import pandas as pd
@@ -266,14 +274,27 @@ def engulfing_retested(prev_candle, engulf_candle, next_candle, side):
         return False
 
 
-# --- NEW: CRT detection ---
+
+# --- NEW: CRT detection (User's Power of Three Strategy) ---
 def is_crt_pattern(c1, c2, c3):
     """
-    Enhanced CRT with stronger confirmation and corrected TP logic.
+    Implements  Power of Three strategy:
+    1. c1 = Accumulation (Defines the range)
+    2. c2 = Manipulation (Sweeps c1 liquidity) + Reversal (Closes back inside c1 range)
+    3. c3 = Confirmation candle (Closes in the trade direction)
+    
+    Entry: Market entry (close of c3)
+    SL: Beyond the manipulation wick (c2)
+    TP: Opposite side of the accumulation range (c1)
     """
     try:
+        # c1 (Accumulation)
         o1, h1, l1, cl1 = c1.open, c1.high, c1.low, c1.close
+        
+        # c2 (Manipulation / Reversal)
         o2, h2, l2, cl2 = c2.open, c2.high, c2.low, c2.close
+        
+        # c3 (Confirmation)
         o3, h3, l3, cl3 = c3.open, c3.high, c3.low, c3.close
         
         range_3 = h3 - l3
@@ -282,61 +303,166 @@ def is_crt_pattern(c1, c2, c3):
         body_3 = abs(cl3 - o3)
         body_ratio_3 = body_3 / range_3 if range_3 > 0 else 0
         
-        # Bearish CRT with stronger confirmation
-        if h2 > h1 and cl2 <= h1 and cl2 >= l1:
-            if cl3 < cl2:
+        # --- Bearish CRT (Power of Three) ---
+        # 1. c2 manipulates c1 high (h2 > h1)
+        # 2. c2 closes back inside c1 range (cl2 <= h1 and cl2 >= l1)
+        # 3. c3 confirms by closing bearish (cl3 < cl2)
+        if (h2 > h1) and (cl2 <= h1 and cl2 >= l1):
+            if cl3 < cl2: # c3 is confirmation
+                
+                # Momentum check on confirmation candle
                 close_position = (cl3 - l3) / range_3
                 if close_position > 0.3 or body_ratio_3 < 0.25:
-                    return None
+                    return None # Weak confirmation
                     
-                entry_price = l2
-                sl_price = h2
-                risk_distance = abs(sl_price - entry_price)
-                tp_price = entry_price - risk_distance  # <<< FIX: TP is now 1:1 R:R below entry
+                entry_price = cl3  # Market entry at close of c3
+                sl_price = h2      # SL beyond manipulation wick
+                tp_price = l1      # TP at opposite side of accumulation (c1 low)
+
+                # --- Sanity Check: Ensure TP/SL are valid ---
+                # 1. SL must be above entry
+                if sl_price <= entry_price:
+                    return None # Invalid trade (e.g., entry is already above SL)
+                # 2. TP must be below entry
+                if tp_price >= entry_price:
+                    return None # Invalid trade (e.g., TP is already hit)
+                # 3. Require at least 1:1 R:R
+                risk = abs(entry_price - sl_price)
+                reward = abs(entry_price - tp_price)
+                if reward < (risk * 0.9): # require at least 0.9R
+                    return None # Bad Risk:Reward
 
                 return {
-                    "pattern": "crt",
+                    "pattern": "crt_power_of_3", # New pattern name
                     "side": "sell",
-                    "entry_trigger": entry_price,
+                    "entry_trigger": entry_price, # This is now a market entry price
                     "sl": sl_price,
-                    "tp": tp_price, # <<< FIX
+                    "tp": tp_price,
                     "momentum_strength": body_ratio_3
                 }
 
-        # Bullish CRT with stronger confirmation
-        if l2 < l1 and cl2 >= l1 and cl2 <= h1:
-            if cl3 > cl2:
+        # --- Bullish CRT (Power of Three) ---
+        # 1. c2 manipulates c1 low (l2 < l1)
+        # 2. c2 closes back inside c1 range (cl2 >= l1 and cl2 <= h1)
+        # 3. c3 confirms by closing bullish (cl3 > cl2)
+        if (l2 < l1) and (cl2 >= l1 and cl2 <= h1):
+            if cl3 > cl2: # c3 is confirmation
+
+                # Momentum check on confirmation candle
                 close_position = (cl3 - l3) / range_3
                 if close_position < 0.7 or body_ratio_3 < 0.25:
-                    return None
+                    return None # Weak confirmation
                     
-                entry_price = h2
-                sl_price = l2
-                risk_distance = abs(sl_price - entry_price)
-                tp_price = entry_price + risk_distance  # <<< FIX: TP is now 1:1 R:R above entry
+                entry_price = cl3  # Market entry at close of c3
+                sl_price = l2      # SL beyond manipulation wick
+                tp_price = h1      # TP at opposite side of accumulation (c1 high)
+                
+                # --- Sanity Check: Ensure TP/SL are valid ---
+                # 1. SL must be below entry
+                if sl_price >= entry_price:
+                    return None # Invalid trade
+                # 2. TP must be above entry
+                if tp_price <= entry_price:
+                    return None # Invalid trade
+                # 3. Require at least 1:1 R:R
+                risk = abs(entry_price - sl_price)
+                reward = abs(entry_price - tp_price)
+                if reward < (risk * 0.9): # require at least 0.9R
+                    return None # Bad Risk:Reward
 
                 return {
-                    "pattern": "crt",
+                    "pattern": "crt_power_of_3", # New pattern name
                     "side": "buy", 
-                    "entry_trigger": entry_price,
+                    "entry_trigger": entry_price, # This is now a market entry price
                     "sl": sl_price,
-                    "tp": tp_price, # <<< FIX
+                    "tp": tp_price,
                     "momentum_strength": body_ratio_3
                 }
 
-        return None
     except Exception:
         return None
+    
+    return None
+
+def is_crt_pattern_mtf(c2, c3, htf_high, htf_low):
+    """
+    Implements the multi-timeframe Power of Three strategy.
+    - htf_high/low: The H1 "Accumulation" range.
+    - c2: The M1 "Manipulation" candle that sweeps the H1 range.
+    - c3: The M1 "Confirmation" candle.
+    """
+    try:
+        # c2 (Manipulation / Reversal candle)
+        o2, h2, l2, cl2 = c2.open, c2.high, c2.low, c2.close
+        # c3 (Confirmation candle)
+        o3, h3, l3, cl3 = c3.open, c3.high, c3.low, c3.close
+
+        # Momentum checks on confirmation candle (c3)
+        range_3 = h3 - l3
+        if range_3 == 0: return None
+        body_3 = abs(cl3 - o3)
+        body_ratio_3 = body_3 / range_3 if range_3 > 0 else 0
+        
+        # --- Bearish CRT (Sell Setup) ---
+        # 1. M1 candle manipulates H1 high (h2 > htf_high)
+        # 2. M1 candle closes back inside H1 range (cl2 <= htf_high)
+        # 3. Next M1 candle confirms by closing bearish (cl3 < cl2)
+        if (h2 > htf_high) and (cl2 <= htf_high):
+            if cl3 < cl2:
+                # Check momentum of confirmation candle (c3)
+                close_position = (cl3 - l3) / range_3
+                if close_position > 0.3 or body_ratio_3 < 0.25:
+                    return None # Weak confirmation
+                
+                entry_price = cl3
+                sl_price = h2
+                tp_price = htf_low
+                
+                # Sanity checks
+                if sl_price <= entry_price or tp_price >= entry_price: return None
+                risk = abs(entry_price - sl_price)
+                reward = abs(entry_price - tp_price)
+                if risk == 0 or reward < (risk * 0.9): return None # Avoid bad R:R
+
+                return { "pattern": "crt_mtf_sell", "side": "sell", "entry_trigger": entry_price, "sl": sl_price, "tp": tp_price }
+
+        # --- Bullish CRT (Buy Setup) ---
+        # 1. M1 candle manipulates H1 low (l2 < htf_low)
+        # 2. M1 candle closes back inside H1 range (cl2 >= htf_low)
+        # 3. Next M1 candle confirms by closing bullish (cl3 > cl2)
+        if (l2 < htf_low) and (cl2 >= htf_low):
+            if cl3 > cl2:
+                # Check momentum of confirmation candle (c3)
+                close_position = (cl3 - l3) / range_3
+                if close_position < 0.7 or body_ratio_3 < 0.25:
+                    return None # Weak confirmation
+
+                entry_price = cl3
+                sl_price = l2
+                tp_price = htf_high
+                
+                # Sanity checks
+                if sl_price >= entry_price or tp_price <= entry_price: return None
+                risk = abs(entry_price - sl_price)
+                reward = abs(entry_price - tp_price)
+                if risk == 0 or reward < (risk * 0.9): return None # Avoid bad R:R
+
+                return { "pattern": "crt_mtf_buy", "side": "buy", "entry_trigger": entry_price, "sl": sl_price, "tp": tp_price }
+
+    except Exception:
+        return None
+    
+    return None
 
 
 # --- Candlestick confidence computation (CALIBRATED) ---
-def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=None, vwap=None, atr=None, m5_context=None):
+def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=None, vwap=None, atr=None, m5_context=None, last_closed_h1=None):
     """
     Input:
       - candles: list-like or DataFrame slice where latest is candles[-1]
       - macd, macd_signal, rsi, vwap, atr: indicator arrays/values (may be None)
       - m5_context: dict with 'trend' key if present
-
+      - last_closed_h1: The last *closed* H1 candle object (for safety filter)
     Output:
       - confidence: float 0.0..1.0
       - pattern_info: dict { 'pattern': str, 'side': 'buy'|'sell' or None, 'crt_extra': {...}|None }
@@ -423,6 +549,40 @@ def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=Non
     except Exception:
         pass
 
+    # === NEW: Inside Bar (Continuation) ===
+    try:
+        # Check mother (c2) and baby (c3) — using function signature
+        if is_inside_bar(o2, h2, l2, cl2, o3, h3, l3, cl3):
+            # If M5 trend context suggests continuation, give decent base conf
+            # but only keep if m5_context indicates a trend direction
+            if m5_context and m5_context.get('trend') == "uptrend":
+                base_conf = max(base_conf, 0.65)
+                pattern = "inside_bar"
+                side = "buy"
+            elif m5_context and m5_context.get('trend') == "downtrend":
+                base_conf = max(base_conf, 0.65)
+                pattern = "inside_bar"
+                side = "sell"
+            else:
+                # No clear M5 trend -> treat as neutral (do not set pattern)
+                pass
+    except Exception:
+        pass
+
+    # === NEW: Inside Bar False Breakout (Stop Hunt) ===
+    try:
+        fakeout_side = is_inside_bar_false_breakout(o2, h2, l2, cl2, o3, h3, l3, cl3)
+        if fakeout_side == "buy":
+            base_conf = max(base_conf, 0.75) # Very high confidence reversal
+            pattern = "inside_bar_fakeout_bullish"
+            side = "buy"
+        elif fakeout_side == "sell":
+            base_conf = max(base_conf, 0.75) # Very high confidence reversal
+            pattern = "inside_bar_fakeout_bearish"
+            side = "sell"
+    except Exception:
+        pass
+
     # --- CRT (Candle Range Theory) ---
     crt_extra = None
     try:
@@ -445,6 +605,24 @@ def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=Non
     # If no pattern detected, return 0
     if not pattern or not side:
         return 0.0, {"pattern": None, "side": None}
+
+    # === NEW: H1 Momentum Safety Filter (Bible p. 70, 83) ===
+    # This filter ensures our M5 signal is not fighting the main H1 momentum.
+    if last_closed_h1 is not None:
+        try:
+            h1_is_bullish = float(_safe_get(last_closed_h1, 'close', _safe_get(last_closed_h1, 'Close', None))) > float(_safe_get(last_closed_h1, 'open', _safe_get(last_closed_h1, 'Open', None)))
+            h1_is_bearish = float(_safe_get(last_closed_h1, 'close', _safe_get(last_closed_h1, 'Close', None))) < float(_safe_get(last_closed_h1, 'open', _safe_get(last_closed_h1, 'Open', None)))
+            
+            if side == "buy" and not h1_is_bullish:
+                # M5 signal is BUY, but H1 momentum is bearish/doji
+                return 0.0, {"pattern": "h1_momentum_misaligned", "side": None} # HARD REJECT
+                
+            if side == "sell" and not h1_is_bearish:
+                # M5 signal is SELL, but H1 momentum is bullish/doji
+                return 0.0, {"pattern": "h1_momentum_misaligned", "side": None} # HARD REJECT
+        except Exception:
+            pass # Fail-safe, skip filter
+    # =========================================================
 
     # --- Confluence adjustments (small boosts/penalties) ---
     conf = base_conf
@@ -528,7 +706,8 @@ def run_trade_decision_engine(
     trend,
     demand_zones,
     supply_zones,
-    last3_candles,
+    m1_candles_for_crt,
+    m5_candles_for_patterns,
     active_trades,
     zone_touch_counts,
     SL_BUFFER, # NOTE: legacy param kept for compatibility
@@ -542,7 +721,12 @@ def run_trade_decision_engine(
     rsi=None,
     vwap=None,
     atr=None,
-    m5_context=None
+    m5_context=None,
+    htf_high=None,  # ✅ New parameter for H1 high
+    htf_low=None,   # ✅ New parameter for H1 low
+    last_closed_h1=None, # <--- ADD THIS
+    fibo_zone=None,      # <--- ADD THIS
+    bollinger_bands=None # <--- ADD THIS
 ):
     """
     Returns:
@@ -696,43 +880,99 @@ def run_trade_decision_engine(
             "strategy": strategy_mode
         }
 
-    # --- Extract candles and context ---
-    # Keep compatibility with your existing DataFrame usage
+    # ======================================================
+    # ✅ 1. EXTRACT M1 CANDLES (for MTF CRT and M1 CRT)
+    # ======================================================
     try:
-        demand_price_check = last3_candles['low'].iloc[-2]
-        supply_price_check = last3_candles['high'].iloc[-2]
-        candle_time = last3_candles['time'].iloc[-1]
-    except Exception:
-        # fallback safe defaults
-        demand_price_check = float(last3_candles['low'].iloc[-1]) if 'low' in last3_candles else 0.0
-        supply_price_check = float(last3_candles['high'].iloc[-1]) if 'high' in last3_candles else 0.0
-        candle_time = datetime.utcnow()
+        if len(m1_candles_for_crt) < 3:
+            log_rejection("not_enough_m1_candles", "n/a", 0, strategy_mode, trend)
+            return signals, flipped_zones
+        
+        c1_m1 = m1_candles_for_crt.iloc[-3] # M1 c1 (for M1 CRT)
+        c2_m1 = m1_candles_for_crt.iloc[-2] # M1 c2 (for M1 CRT + MTF CRT)
+        c3_m1 = m1_candles_for_crt.iloc[-1] # M1 c3 (for M1 CRT + MTF CRT)
+    except Exception as e:
+        log_rejection(f"m1_candle_extraction_failed: {e}", "n/a", 0, strategy_mode, trend)
+        return signals, flipped_zones
+    
+    
+    # ======================================================
+    # ✅ 2. EXTRACT M5 CANDLES (for Zone-based Patterns)
+    # ======================================================
+    try:
+        if len(m5_candles_for_patterns) < 5:
+            log_rejection("not_enough_m5_candles_for_patterns", "n/a", 0, strategy_mode, trend)
+            return signals, flipped_zones
+        
+        candles_for_patterns = m5_candles_for_patterns.tail(5)
+        c1_pat_m5 = candles_for_patterns.iloc[-3]
+        c2_pat_m5 = candles_for_patterns.iloc[-2]
+        c3_pat_m5 = candles_for_patterns.iloc[-1]
+        candle = c3_pat_m5
+        prev_candle = c2_pat_m5
+        
+        demand_price_check = c2_pat_m5.low
+        supply_price_check = c2_pat_m5.high
+        candle_time = c3_pat_m5.time
+        
+        # === Compatibility alias (to prevent downstream errors) ===
+        # Many old parts of the file still reference `last3_candles` and `candles`
+        # We'll map them to M5 candles so they stay functional
+        last3_candles = m5_candles_for_patterns.tail(5)
+        candles = last3_candles
+        c1, c2, c3 = c1_pat_m5, c2_pat_m5, c3_pat_m5
+    except Exception as e:
+        log_rejection(f"m5_candle_extraction_failed: {e}", "n/a", 0, strategy_mode, trend)
+        return signals, flipped_zones
+    
+    # ======================================================
+    # ✅ 3. PRIORITIZED MULTI-TIMEFRAME CRT STRATEGY (H1 + M1)
+    # ======================================================
+    crt_signal = None
+    if htf_high is not None and htf_low is not None:
+        try:
+            crt_signal = is_crt_pattern_mtf(c2_m1, c3_m1, htf_high, htf_low)
+        except Exception:
+            crt_signal = None
 
-    candles = last3_candles.tail(5)
-    c1 = candles.iloc[-3]
-    c2 = candles.iloc[-2]
-    c3 = candles.iloc[-1]
-    candle = c3
-    prev_candle = c2
+    if crt_signal is not None:
+        order = {
+            "side": crt_signal.get("side"),
+            "entry": crt_signal.get("entry_trigger"),
+            "sl": crt_signal.get("sl"),
+            "tp": crt_signal.get("tp"),
+            "zone": None,
+            "lot": LOT_SIZE,
+            "strategy": "crt_mtf",
+            "reason": crt_signal.get("pattern"),
+            "confidence": 0.90
+        }
+
+        conflict = _active_trade_conflict(active_trades, symbol, order['side'])
+        if not conflict:
+            signals.append(order)
+
+        # 🔸 Immediate return — MTF CRT takes precedence
+        return signals, flipped_zones
 
     all_zones = [("demand", demand_zones), ("supply", supply_zones)]
 
     # --- CRT handling ---
-    crt_signal = None
+    crt_signal_m1 = None
     try:
-        crt_signal = is_crt_pattern(c1, c2, c3)
+        crt_signal_m1 = is_crt_pattern(c1_m1, c2_m1, c3_m1)
     except Exception:
-        crt_signal = None
+        crt_signal_m1 = None
 
-    if crt_signal is not None:
-        raw_entry = crt_signal.get("entry_trigger", getattr(c3, 'close', c3['close']))
-        raw_sl = crt_signal.get("sl", getattr(c3, 'close', c3['close']))
-        raw_tp = crt_signal.get("tp", getattr(c3, 'close', c3['close']))
+    if crt_signal_m1 is not None:
+        raw_entry = crt_signal_m1.get("entry_trigger", getattr(c3, 'close', c3['close']))
+        raw_sl = crt_signal_m1.get("sl", getattr(c3, 'close', c3['close']))
+        raw_tp = crt_signal_m1.get("tp", getattr(c3, 'close', c3['close']))
 
         entry_buffer = point * 5
-        if crt_signal.get("side") == "buy":
+        if crt_signal_m1.get("side") == "buy":
             raw_entry += entry_buffer
-        elif crt_signal.get("side") == "sell":
+        elif crt_signal_m1.get("side") == "sell":
             raw_entry -= entry_buffer
 
         try:
@@ -743,7 +983,7 @@ def run_trade_decision_engine(
             candle_range_value = abs(_safe_get(c2, 'close', 0) - _safe_get(c2, 'open', 0))
 
         temp_order = {
-            "side": crt_signal.get("side"),
+            "side": crt_signal_m1.get("side"),
             "entry": raw_entry,
             "sl": raw_sl,
             "tp": raw_tp,
@@ -762,7 +1002,8 @@ def run_trade_decision_engine(
                 rsi=rsi,
                 vwap=vwap,
                 atr=atr,
-                m5_context=m5_context
+                m5_context=m5_context,
+                last_closed_h1=last_closed_h1  # <--- PASS H1 safety here too
             )
             temp_order["confidence"] = crt_conf if crt_conf and crt_conf > 0 else temp_order["confidence"]
         except Exception:
@@ -848,6 +1089,29 @@ def run_trade_decision_engine(
             is_fast = "fast" in str(zone.get('type', '')).lower()
             lot_size = LOT_SIZE / 2 if is_fast else LOT_SIZE
 
+            # === NEW: Ranging Market Bollinger Band Filter (Bible p. 106) ===
+            if strategy_mode == "ranging" and bollinger_bands:
+                # In ranging mode, we ONLY trade if the H1 zone *also*
+                # has confluence with the Bollinger Bands.
+                bb_low = bollinger_bands.get('demand')
+                bb_high = bollinger_bands.get('supply')
+                
+                # Check for confluence
+                try:
+                    # Use CHECK_RANGE as units (approx price distance); if zone vs band far -> skip
+                    if zone_type == "demand" and (bb_low is None or abs(zone_price - bb_low) > (CHECK_RANGE * 2)):
+                        log_rejection("ranging_bb_no_confluence", zone_type, zone_price, strategy_mode, trend)
+                        continue # Skip this zone
+
+                    if zone_type == "supply" and (bb_high is None or abs(zone_price - bb_high) > (CHECK_RANGE * 2)):
+                        log_rejection("ranging_bb_no_confluence", zone_type, zone_price, strategy_mode, trend)
+                        continue # Skip this zone
+                except Exception:
+                    # If anything goes wrong, be conservative and skip
+                    log_rejection("ranging_bb_exception", zone_type, zone_price, strategy_mode, trend)
+                    continue
+            # =============================================================
+
             dist = abs(demand_price_check - zone_price) if zone_type == "demand" else abs(supply_price_check - zone_price)
             in_zone = dist < CHECK_RANGE
             touch_number = update_touch_count(zone_price, candle_time, in_zone)
@@ -871,13 +1135,14 @@ def run_trade_decision_engine(
 
             # --- Compute candlestick confidence + pattern info ---
             cand_conf, pattern_info = compute_candlestick_confidence(
-                candles,
+                candles_for_patterns,
                 macd=macd,
                 macd_signal=macd_signal,
                 rsi=rsi,
                 vwap=vwap,
                 atr=atr,
-                m5_context=m5_context
+                m5_context=m5_context,
+                last_closed_h1=last_closed_h1  # <--- PASS H1 safety here
             )
             
             # ==========================================================
@@ -895,8 +1160,7 @@ def run_trade_decision_engine(
                 # If check fails, log it but don't stop the bot
                 log_rejection(f"volatility_filter_exception: {e}", zone_type, zone_price, strategy_mode, trend)
             # ==========================================================
-           
-           
+
 
             desired_side = "buy" if zone_type == "demand" else "sell"
             if not pattern_info or pattern_info.get('side') is None:
@@ -963,6 +1227,24 @@ def run_trade_decision_engine(
                             continue
                 except Exception:
                     pass
+
+            # === NEW: Fibonacci Confluence Boost (Bible p. 96, 100) ===
+            order_side = pattern_info.get('side')
+            if fibo_zone and order_side:
+                try:
+                    fibo_min = min(fibo_zone)
+                    fibo_max = max(fibo_zone)
+                    
+                    # Check if the pattern's zone_price is inside the Fibo zone
+                    if fibo_min <= zone_price <= fibo_max:
+                        # Check if it's a pullback in a trend
+                        if (order_side == "buy" and trend == "uptrend") or \
+                           (order_side == "sell" and trend == "downtrend"):
+                            
+                            cand_conf += 0.15 # Significant confidence boost
+                except Exception:
+                    pass # Fibo check failsafe
+            # ========================================================
 
             # Final required confidence depending on strategy (use calibrated thresholds)
             required_conf = MIN_CONFIDENCE_FOR_TRADE
