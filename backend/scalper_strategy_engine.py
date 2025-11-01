@@ -989,23 +989,7 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
                     for k in keys_to_remove:
                         _last_crt_alerts.pop(k, None)
 
-                    append_trade_to_local_csv({
-                        "trade_id": trade_id,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "symbol": symbol,
-                        "strategy": strategy,
-                        "side": side,
-                        "entry_reason": reason,
-                        "zone_price": zone,
-                        "entry_price": entry,
-                        "sl": sl,
-                        "tp": tp,
-                        "lot_size": lot,
-                        "exit_price": "",
-                        "exit_time": "",
-                        "profit": "",
-                        "result": "PLACED"
-                    })
+                    #trade_id = log_pending_trade(strategy, side, reason, zone, entry, sl, tp, lot, symbol=symbol, trade_id=ticket)
                 else:
                     safe_telegram(f"❌ Order Failed {symbol} {side.upper()} conf:{confidence:.2f} result:{result}")
                     send_info(f"[ORDER FAIL] result: {result}")
