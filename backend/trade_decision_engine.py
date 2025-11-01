@@ -821,55 +821,78 @@ def run_trade_decision_engine(
         return False
 
     def build_entry(side, candle, prev_candle, zone_price, lot_size, atr_value, point_value, all_zones):
-        # --- 1. Dynamic SL Calculation (Mandatory ATR usage) ---
-        ATR_SL_MULTIPLIER = 2.0  # 2x ATR for SL distance
+    
+        # === SL & LOT SIZE FIX ===
+        # Reduced multiplier from 2.0 to 0.5. The SL is placed below the
+        # pattern's wick + this small buffer. This is tighter and per the Bible's logic.
+        ATR_SL_MULTIPLIER = 0.5  # 0.5x ATR buffer (was 2.0)
+        # Reduced fixed SL points from 150 to 50 (5 pips fallback)
+        MIN_ABS_SL_DISTANCE = 50 * point_value # Was 150
+        # =========================
+        
         entry_price = getattr(candle, 'close', candle['close'])
-
+        
+        # --- 1. Dynamic SL Calculation (Tighter Logic) ---
         if atr_value is None or pd.isna(atr_value) or atr_value <= 0:
-            MIN_ABS_SL_DISTANCE = 150 * point_value
+            # Fallback to fixed points
             if side == "buy":
-                wick_sl = entry_price - MIN_ABS_SL_DISTANCE
+                wick_sl = getattr(candle, 'low', candle['low']) - MIN_ABS_SL_DISTANCE
             else:
-                wick_sl = entry_price + MIN_ABS_SL_DISTANCE
+                wick_sl = getattr(candle, 'high', candle['high']) + MIN_ABS_SL_DISTANCE
         else:
-            sl_distance = float(atr_value) * ATR_SL_MULTIPLIER
+            # Standard logic: Wick + ATR buffer
+            sl_distance_buffer = float(atr_value) * ATR_SL_MULTIPLIER # This is now a small buffer
             if side == "buy":
+                # SL is placed below the LOW of the last two candles
                 recent_low = min(getattr(candle, 'low', candle['low']), getattr(prev_candle, 'low', prev_candle['low']))
-                wick_sl = recent_low - sl_distance
+                wick_sl = recent_low - sl_distance_buffer # SL = wick low - 0.5*ATR
             else:
+                # SL is placed above the HIGH of the last two candles
                 recent_high = max(getattr(candle, 'high', candle['high']), getattr(prev_candle, 'high', prev_candle['high']))
-                wick_sl = recent_high + sl_distance
+                wick_sl = recent_high + sl_distance_buffer # SL = wick high + 0.5*ATR
 
         # --- 2. Dynamic TP Calculation (Structural / Volatility-Adjusted) ---
-        risk_pips = abs(entry_price - wick_sl)
-        BASE_TP_RATIO = 2.0
+        risk_distance = abs(entry_price - wick_sl)
+        
+        # Ensure minimum 1-pip risk
+        if risk_distance < (point_value * 10):
+            if side == "buy":
+                wick_sl = entry_price - (point_value * 10)
+            else:
+                wick_sl = entry_price + (point_value * 10)
+            risk_distance = abs(entry_price - wick_sl)
 
+        # Use the user's global TP_RATIO (which is 2)
+        tp_atr_ratio = entry_price + (risk_distance * TP_RATIO) if side == "buy" else entry_price - (risk_distance * TP_RATIO)
+
+        # Find the nearest structural TP
         opposing_zone_type = "supply" if side == "buy" else "demand"
         opposing_zones = [z for z in all_zones if opposing_zone_type in z['type']]
 
         tp_structural = None
         min_tp_dist = float('inf')
         for z in opposing_zones:
-            dist = abs(z['price'] - entry_price)
-            if dist > 0 and dist < min_tp_dist:
-                min_tp_dist = dist
-                tp_structural = z['price']
+            # Ensure zone is profitable
+            if (side == "buy" and z['price'] > entry_price) or (side == "sell" and z['price'] < entry_price):
+                dist = abs(z['price'] - entry_price)
+                if dist < min_tp_dist:
+                    min_tp_dist = dist
+                    tp_structural = z['price']
 
-        tp_atr_ratio = entry_price + BASE_TP_RATIO * risk_pips if side == "buy" else entry_price - BASE_TP_RATIO * risk_pips
-
+        # --- TP Decision Logic ---
+        # Default to the 2R TP
+        tp = tp_atr_ratio
+        
+        # If a structural TP exists:
         if tp_structural is not None:
-            if abs(tp_structural - entry_price) >= risk_pips:
-                if side == "buy" and tp_structural < tp_atr_ratio and abs(tp_structural - entry_price) > risk_pips * 1.5:
+            # 1. Check if structural TP is *at least* 1R away
+            if abs(tp_structural - entry_price) >= risk_distance * 0.9:
+                # 2. Check if structural TP is *closer* than the 2R TP
+                if (side == "buy" and tp_structural < tp_atr_ratio) or \
+                (side == "sell" and tp_structural > tp_atr_ratio):
+                    # Use the (safer, closer) structural TP
                     tp = tp_structural
-                elif side == "sell" and tp_structural > tp_atr_ratio and abs(tp_structural - entry_price) > risk_pips * 1.5:
-                    tp = tp_structural
-                else:
-                    tp = tp_atr_ratio
-            else:
-                tp = tp_atr_ratio
-        else:
-            tp = tp_atr_ratio
-
+        
         return {
             "side": side,
             "entry": entry_price,
@@ -931,18 +954,44 @@ def run_trade_decision_engine(
     crt_signal = None
     if htf_high is not None and htf_low is not None:
         try:
+            # We pass ATR down, so the CRT signal itself is more robust
             crt_signal = is_crt_pattern_mtf(c2_m1, c3_m1, htf_high, htf_low)
         except Exception:
             crt_signal = None
 
     if crt_signal is not None:
+        
+        # === SL & LOT SIZE FIX (APPLY BUFFER) ===
+        sl_price = crt_signal.get("sl")
+        entry_price = crt_signal.get("entry_trigger")
+        order_side = crt_signal.get("side")
+        atr_buffer = 0.0
+        
+        if atr is not None and not pd.isna(atr):
+            atr_buffer = float(atr) * 1.0 # 1x M1 ATR buffer
+        
+        # Apply ATR buffer to the raw SL wick
+        if order_side == "buy":
+            sl_price = sl_price - atr_buffer
+        else:
+            sl_price = sl_price + atr_buffer
+        
+        # Enforce a minimum 3-pip (30 points) SL distance
+        min_sl_dist = point * 30 
+        if abs(entry_price - sl_price) < min_sl_dist:
+            if order_side == "buy":
+                sl_price = entry_price - min_sl_dist
+            else:
+                sl_price = entry_price + min_sl_dist
+        # =======================================
+        
         order = {
-            "side": crt_signal.get("side"),
-            "entry": crt_signal.get("entry_trigger"),
-            "sl": crt_signal.get("sl"),
+            "side": order_side,
+            "entry": entry_price,       # Use original entry
+            "sl": sl_price,             # Use NEW buffered SL
             "tp": crt_signal.get("tp"),
             "zone": None,
-            "lot": LOT_SIZE,
+            "lot": LOT_SIZE, # This is just a placeholder, risk calc will override
             "strategy": "crt_mtf",
             "reason": crt_signal.get("pattern"),
             "confidence": 0.90
