@@ -20,6 +20,10 @@ What’s inside (high level):
 - Fixed side.upper() usage (removed accidental side.UPPER()).
 - DRY_RUN behaviour preserved; runtime maps store trade_id + ticket for reliable backfilling.
 - Kept rejected-signal flush, trailing SL, auto-close and daily summary intact.
+
+✅ Zone Quality Fixes:
+- MAX_TOUCH_ALLOWED changed from 3 to 2 (Solution 3)
+- Added Broken Zone Filter: Removes demand zones > price and supply zones < price (Solution 1)
 """
 from datetime import datetime, timedelta, timezone, time as dtime
 import time as time_module          # alias stdlib module to avoid shadowing
@@ -164,7 +168,7 @@ CONF_PRIORITY_GLOBAL_MIN = 0.50     # absolute min to consider ordering logic (f
 ALLOW_PYRAMID_SAME_SIDE = False     # if True, adds to same-side position on same symbol
 AUTO_CLOSE_ON_STRONG = True         # if True, will attempt to close existing positions if opposite signal is much stronger
 CLOSE_CONF_DIFF = 0.12              # new_conf must exceed existing_conf + this to trigger auto-close
-MAX_TOUCH_ALLOWED = 3
+MAX_TOUCH_ALLOWED = 2               # <<< SOLUTION 3: Changed from 3 to 2
 
 # Daily summary schedule (Africa/Johannesburg local time)
 SUMMARY_HOUR = 23
@@ -384,7 +388,75 @@ def print_detected_zones(symbol, demand_zones, supply_zones, fast_demand, fast_s
             print(f"  Supply zone: {z}")
     print(f"[INFO] {symbol} Fast Zones: demand {len(fast_demand)} supply {len(fast_supply)}")
 
+# ============================
+# STATE RECOVERY (NEW)
+# ============================
 
+def load_open_trades_from_csv(path=TRADES_LOCAL_CSV):
+    """
+    Reloads active trades from the CSV file on startup.
+    This repopulates the 'active_trades_by_symbol' map so the bot
+    can manage and close trades that were open before a restart.
+    """
+    global active_trades_by_symbol
+    if not os.path.isfile(path):
+        send_info("[STATE] No local trade history found, starting fresh.")
+        return
+
+    send_info(f"[STATE] Loading open trades from {path}...")
+    reloaded_count = 0
+    try:
+        with open(path, mode="r", newline="", encoding="utf-8") as f:
+            # Use DictReader to read CSV by header names
+            reader = csv.DictReader(f)
+            for row in reader:
+                # An 'open' trade has no exit_price or result
+                is_open = (row.get('exit_price') == '' or row.get('exit_price') is None) and \
+                          (row.get('result') == '' or row.get('result') is None)
+                
+                if is_open:
+                    symbol = row.get('symbol')
+                    side = row.get('side')
+                    ticket_str = row.get('trade_id') # This is the ticket
+                    timestamp_str = row.get('timestamp')
+
+                    if not all([symbol, side, ticket_str, timestamp_str]):
+                        send_info(f"[WARN] Skipping malformed open trade row: {row}")
+                        continue
+
+                    try:
+                        # Convert string timestamp back to epoch float
+                        ts_epoch = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S").timestamp()
+                        ticket_int = int(ticket_str)
+                    except Exception as e:
+                        send_info(f"[WARN] Could not parse reloaded trade data for {ticket_str}: {e}")
+                        continue
+
+                    # Check for conflict (should not happen if logic is sound, but good safety)
+                    if symbol in active_trades_by_symbol:
+                        send_info(f"[WARN] Conflict on reload: {symbol} already in active map. Ignoring CSV row.")
+                        continue
+                        
+                    # Repopulate the map
+                    active_trades_by_symbol[symbol] = {
+                        'side': side,
+                        'ticket': ticket_int,
+                        'trade_id': ticket_str,  # Keep string for trade_logger matching
+                        'confidence': None,     # Confidence is lost on restart (this disables auto-close, which is safe)
+                        'ts': ts_epoch
+                    }
+                    reloaded_count += 1
+                    send_info(f"  > Reloaded active trade: {symbol} {side.upper()} (Ticket: {ticket_str})")
+
+        if reloaded_count > 0:
+            send_info(f"[STATE] Successfully reloaded {reloaded_count} open trade(s).")
+        else:
+            send_info("[STATE] No open trades found in CSV to reload.")
+
+    except Exception as e:
+        send_info(f"[ERROR] Failed to read trade history file {path}: {e}\n{traceback.format_exc()}")
+        
+        
 # ============================
 # REJECTED SIGNALS CSV FLUSH
 # ============================
@@ -737,6 +809,22 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
         send_info(f"[ERROR] No tick data for {symbol}.")
         return
     price = float(tick.bid)
+
+    # === SOLUTION 1: Filter out broken/violated zones ===
+    original_demand_count = len(demand_zones)
+    original_supply_count = len(supply_zones)
+    
+    # Keep demand zones that are BELOW the current price
+    demand_zones = [z for z in demand_zones if z['price'] < price]
+    # Keep supply zones that are ABOVE the current price
+    supply_zones = [z for z in supply_zones if z['price'] > price]
+
+    filtered_demand_count = len(demand_zones)
+    filtered_supply_count = len(supply_zones)
+    
+    if (original_demand_count != filtered_demand_count) or (original_supply_count != filtered_supply_count):
+        send_info(f"[ZONE FILTER] {symbol}: Filtered zones. Demand: {original_demand_count} -> {filtered_demand_count}. Supply: {original_supply_count} -> {filtered_supply_count}.")
+    # ======================================================
 
     sinfo = mt5.symbol_info(symbol)
     if sinfo is None:
@@ -1193,11 +1281,27 @@ def check_closed_trades(symbol, lookback_days=2):
 # ============================
 if __name__ == "__main__":
     send_info(f"scalper_strategy_engine starting. DRY_RUN={DRY_RUN}")
+
+    # --- NEW: Initialize MT5 connection ---
+    if not mt5_init_if_needed():
+        send_info("[CRITICAL] MT5 connection failed on startup. Exiting.")
+        safe_telegram("❌ Bot failed to connect to MT5 on startup. Please check credentials/server.")
+        exit() # Exit if we can't connect at all
+        
+    send_info("[INFO] MT5 connection successful.")
+
+    # --- NEW: Load state ---
+    try:
+        load_open_trades_from_csv()
+    except Exception as e:
+        send_info(f"[CRITICAL] Failed to load open trades state: {e}")
+    
     send_startup_intro()
     time_module.sleep(2)   # fixed
+    
     for sym in SYMBOLS:
         try:
-            symbol = normalize_symbol(sym)
+            symbol = normalize_symbol(sym) # This will now use the active connection
             monitor_and_trade(symbol)
         except Exception as e:
             send_info(f"[ERROR] monitor_and_trade for {sym} failed: {e}\n{traceback.format_exc()}")
