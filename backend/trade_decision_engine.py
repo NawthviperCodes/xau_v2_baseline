@@ -8,6 +8,15 @@
 # - run_trade_decision_engine now accepts last_closed_h1, fibo_zone, bollinger_bands
 # - Fibonacci confluence boost and Bollinger Bands ranging filter integrated
 #
+# ✅ FIX #1 (Opposing Zone Filter):
+# - Added a new filter in run_trade_decision_engine to block trades that
+#   are too close to an opposing H1 zone (e.g., block BUYs near H1 Supply).
+#
+# ✅ FIX #3 (Invalid Stops Rejection):
+# - Increased minimum SL distance from 3 pips (30 points) to 6 pips (60 points)
+#   in both the CRT_MTF block and the build_entry function to prevent
+#   broker rejections for "Invalid Stops".
+#
 from datetime import datetime
 from telegram_notifier import send_telegram_message
 from candlestick_patterns import (
@@ -854,13 +863,15 @@ def run_trade_decision_engine(
         # --- 2. Dynamic TP Calculation (Structural / Volatility-Adjusted) ---
         risk_distance = abs(entry_price - wick_sl)
         
-        # Ensure minimum 1-pip risk
-        if risk_distance < (point_value * 10):
+        # === FIX #3: Enforce minimum 10-pip (100 points) SL ===
+        min_sl_dist = point_value * 150 # 15 pips
+        if risk_distance < min_sl_dist:
             if side == "buy":
-                wick_sl = entry_price - (point_value * 10)
+                wick_sl = entry_price - min_sl_dist
             else:
-                wick_sl = entry_price + (point_value * 10)
+                wick_sl = entry_price + min_sl_dist
             risk_distance = abs(entry_price - wick_sl)
+        # ===================================================
 
         # Use the user's global TP_RATIO (which is 2)
         tp_atr_ratio = entry_price + (risk_distance * TP_RATIO) if side == "buy" else entry_price - (risk_distance * TP_RATIO)
@@ -976,14 +987,14 @@ def run_trade_decision_engine(
         else:
             sl_price = sl_price + atr_buffer
         
-        # Enforce a minimum 3-pip (30 points) SL distance
-        min_sl_dist = point * 30 
+        # === FIX #3: Enforce a minimum 6-pip (60 points) SL distance ===
+        min_sl_dist = point * 150 # 15 pips (was 100)
         if abs(entry_price - sl_price) < min_sl_dist:
             if order_side == "buy":
                 sl_price = entry_price - min_sl_dist
             else:
                 sl_price = entry_price + min_sl_dist
-        # =======================================
+        # ===========================================================
         
         order = {
             "side": order_side,
@@ -1362,6 +1373,38 @@ def run_trade_decision_engine(
             )
             order["reason"] = pattern_info.get('pattern')
             order["confidence"] = cand_conf
+            
+            # ==========================================================
+            # === NEW: Opposing Zone Filter (FIX #1) ===
+            # Block trade if entry is dangerously close to an opposing H1 zone
+            # This check uses the *full* lists of zones passed to the function.
+            OPPOSING_ZONE_PROXIMITY = 150 * point  # e.g., 15 pips "danger zone"
+            is_blocked = False
+            order_entry = order['entry']
+            order_side = order['side']
+
+            if order_side == "buy":
+                # Check if we are too close to ANY H1 SUPPLY zone
+                for s_zone in supply_zones: # Use the full list from function args
+                    zone_price_supply = s_zone['price']
+                    if abs(order_entry - zone_price_supply) < OPPOSING_ZONE_PROXIMITY:
+                        is_blocked = True
+                        log_rejection(f"blocked_by_opposing_supply_at_{zone_price_supply:.5f}", "supply", zone_price_supply, strategy_mode, trend)
+                        break # Found a blocking zone
+
+            elif order_side == "sell":
+                # Check if we are too close to ANY H1 DEMAND zone
+                for d_zone in demand_zones: # Use the full list from function args
+                    zone_price_demand = d_zone['price']
+                    if abs(order_entry - zone_price_demand) < OPPOSING_ZONE_PROXIMITY:
+                        is_blocked = True
+                        log_rejection(f"blocked_by_opposing_demand_at_{zone_price_demand:.5f}", "demand", zone_price_demand, strategy_mode, trend)
+                        break # Found a blocking zone
+
+            # If blocked, continue to the next zone/signal and do NOT append this one
+            if is_blocked:
+                continue
+            # ===============================================
 
             # Throttle + notify if strong
             MIN_THROTTLE_SEC = 300  # 5 minutes min

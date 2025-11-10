@@ -1,44 +1,84 @@
 # === zone_detector.py (Forex: Strict + Fast Zones) ===
 import pandas as pd
+from ta.volatility import AverageTrueRange # <-- ADDED FOR QUALITY CHECK
 
 
 def detect_zones(df, lookback=100, zone_size=5):
     """
     Detect strong supply and demand zones (pivot-based).
     Works best for longer-term structure levels.
+    
+    ✅ ENHANCEMENT (Zone Quality):
+    - Now includes a "Strength of Departure" filter.
+    - A zone is only valid if price moves at least (DEPARTURE_ATR_MULTIPLIER) * ATR
+      away from it within (N_CANDLES_FOR_DEPARTURE) candles.
     """
     demand_zones = []
     supply_zones = []
 
-    if df is None or len(df) < (zone_size * 2 + 1):
+    if df is None or len(df) < (zone_size * 2 + 1) or len(df) < 20: # Need 20 for ATR
         return demand_zones, supply_zones
 
-    for i in range(zone_size, len(df) - zone_size):
+    # === NEW: Calculate ATR for quality check ===
+    try:
+        atr = AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
+    except Exception as e:
+        print(f"[zone_detector] ATR calculation failed: {e}")
+        return demand_zones, supply_zones # Return empty if ATR fails
+
+    # === NEW: Quality Check Parameters ===
+    N_CANDLES_FOR_DEPARTURE = 3
+    DEPARTURE_ATR_MULTIPLIER = 2.0 # Must move 2x ATR to be considered "explosive"
+
+    # Ensure ATR calculation is complete before iterating
+    df = df.copy()
+    df['atr'] = atr
+    
+    # Start loop later to ensure ATR has valid data
+    start_index = max(zone_size, 14) # Start after ATR calculation period
+
+    for i in range(start_index, len(df) - zone_size - N_CANDLES_FOR_DEPARTURE):
         candle = df.iloc[i]
         prev_candles = df.iloc[i - zone_size:i]
         next_candles = df.iloc[i + 1:i + 1 + zone_size]
+        
+        atr_at_pivot = candle['atr']
+        if pd.isna(atr_at_pivot) or atr_at_pivot == 0:
+            continue # Skip if ATR is invalid
 
-        # Strict Demand Zone (pivot low)
+        # === 1. Find Strict Demand Zone (pivot low) ===
         if (
             all(candle.low < x.low for x in prev_candles.itertuples()) and
             all(candle.low < x.low for x in next_candles.itertuples())
         ):
-            demand_zones.append({
-                "type": "demand",
-                "price": float(candle.low),
-                "time": candle.time
-            })
+            # === 2. Quality Check: Strength of Departure ===
+            departure_candles = df.iloc[i + 1 : i + 1 + N_CANDLES_FOR_DEPARTURE]
+            max_high_after_pivot = departure_candles['high'].max()
+            
+            # Check if price moved up explosively
+            if (max_high_after_pivot - candle.low) > (atr_at_pivot * DEPARTURE_ATR_MULTIPLIER):
+                demand_zones.append({
+                    "type": "demand",
+                    "price": float(candle.low),
+                    "time": candle.time
+                })
 
-        # Strict Supply Zone (pivot high)
+        # === 1. Find Strict Supply Zone (pivot high) ===
         if (
             all(candle.high > x.high for x in prev_candles.itertuples()) and
             all(candle.high > x.high for x in next_candles.itertuples())
         ):
-            supply_zones.append({
-                "type": "supply",
-                "price": float(candle.high),
-                "time": candle.time
-            })
+            # === 2. Quality Check: Strength of Departure ===
+            departure_candles = df.iloc[i + 1 : i + 1 + N_CANDLES_FOR_DEPARTURE]
+            min_low_after_pivot = departure_candles['low'].min()
+            
+            # Check if price moved down explosively
+            if (candle.high - min_low_after_pivot) > (atr_at_pivot * DEPARTURE_ATR_MULTIPLIER):
+                supply_zones.append({
+                    "type": "supply",
+                    "price": float(candle.high),
+                    "time": candle.time
+                })
 
     return demand_zones, supply_zones
 

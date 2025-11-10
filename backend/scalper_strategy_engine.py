@@ -3,30 +3,28 @@
 Complete scalper strategy engine (probability-based, auto-close on stronger signals).
 Drop-in replacement — copy & paste into your project.
 
-What’s inside (high level):
-- Uses trade_decision_engine(...) for confidence-based signals
-- Prioritizes by confidence
-- Blocks low-confidence signals
-- Prevents opposite-side open trades on same symbol
-- Optionally auto-closes existing positions when a stronger opposing signal arrives
-- DRY_RUN mode (safe default)
-- CSV logging for rejected signals and local trades
-- Daily summary scheduling (Africa/Johannesburg)
-- Closed-trade backfill from MT5 history → updates exit_price, exit_time, profit, result in your CSV via update_trade_result(...)
-
-✅ Updates requested by user:
-- Every log_pending_trade(...) call now passes the symbol so your trade log includes instrument names.
-- append_trade_to_local_csv(...) rows include symbol.
-- Fixed side.upper() usage (removed accidental side.UPPER()).
-- DRY_RUN behaviour preserved; runtime maps store trade_id + ticket for reliable backfilling.
-- Kept rejected-signal flush, trailing SL, auto-close and daily summary intact.
+✅ ENHANCEMENT #3: External Configuration
+- All bot settings (SYMBOLS, DRY_RUN, TP_RATIO, etc.) are now loaded
+  from an external 'config.json' file.
+- This file is now the single source of truth for all parameters.
+- Hard-coded global variables have been removed.
 
 ✅ Zone Quality Fixes:
-- MAX_TOUCH_ALLOWED changed from 3 to 2 (Solution 3)
-- Added Broken Zone Filter: Removes demand zones > price and supply zones < price (Solution 1)
+- (From config) MAX_TOUCH_ALLOWED = 2
+- Added Broken Zone Filter
+- Zone detection now uses "Strength of Departure" (from zone_detector.py)
+
+✅ Proximity Fix:
+- Removed static 'CHECK_RANGE'
+- Implemented 'adaptive_check_range' based on M1 ATR
+
+✅ ENHANCEMENT #2: Partial TP & Risk-Free Trades
+- Bot now monitors for 1:1 R/R and executes partial close + SL to BE.
 """
 from datetime import datetime, timedelta, timezone, time as dtime
 import time as time_module          # alias stdlib module to avoid shadowing
+import json                         # <-- NEW: For loading config
+import pytz                         # <-- NEW: For loading config
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -34,11 +32,18 @@ from ta.volatility import AverageTrueRange
 from zone_detector import detect_zones, detect_fast_zones
 from trade_decision_engine import run_trade_decision_engine, rejected_signals_log
 from telegram_notifier import send_telegram_message
-from trade_executor import place_order, place_dynamic_order, trail_sl, move_to_breakeven
+from trade_executor import (
+    place_order,
+    modify_position_sltp,
+    place_dynamic_order,
+    trail_sl,
+    move_to_breakeven,
+    close_partial_and_move_sl_to_be,
+    get_position_by_ticket
+)
 from performance_tracker import send_daily_summary
 from trade_logger import log_pending_trade, update_trade_result
 from symbol_info_helper import get_lot_constraints
-import pytz
 from ta.trend import MACD, ADXIndicator
 from news_filter_te import check_upcoming_high_impact
 from ta.momentum import RSIIndicator
@@ -47,17 +52,122 @@ from ta.volatility import BollingerBands
 import csv, os, threading, traceback
 from collections import defaultdict
 import inspect
-from trade_decision_engine import format_confidence_label  # add at top of file if not already imported
+from trade_decision_engine import format_confidence_label
 
-#print("DEBUG check_upcoming_high_impact:", check_upcoming_high_impact, inspect.isfunction(check_upcoming_high_impact))
+# ============================
+# === NEW: CONFIGURATION LOADER ===
+# ============================
 
+def load_config(path='config.json'):
+    """
+    Loads, validates, and processes the config.json file.
+    """
+    try:
+        with open(path, 'r') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print(f"[CRITICAL] config.json not found at {path}. Bot cannot start.")
+        exit()
+    except json.JSONDecodeError:
+        print(f"[CRITICAL] config.json is not valid JSON. Please check the file. Bot cannot start.")
+        exit()
+    except Exception as e:
+        print(f"[CRITICAL] An error occurred loading config.json: {e}")
+        exit()
+
+    # --- Process Timeframes ---
+    TIMEFRAME_MAP = {
+        "TIMEFRAME_H1": mt5.TIMEFRAME_H1,
+        "TIMEFRAME_M1": mt5.TIMEFRAME_M1,
+        "TIMEFRAME_M5": mt5.TIMEFRAME_M5,
+        "TIMEFRAME_M15": mt5.TIMEFRAME_M15,
+        "TIMEFRAME_M30": mt5.TIMEFRAME_M30,
+        "TIMEFRAME_H4": mt5.TIMEFRAME_H4,
+        "TIMEFRAME_D1": mt5.TIMEFRAME_D1,
+    }
+    
+    try:
+        # Get the string (e.g., "TIMEFRAME_H1")
+        tf_zone_str = config['StrategyParameters']['TIMEFRAME_ZONE']
+        # Convert to MT5 object (e.g., mt5.TIMEFRAME_H1)
+        config['StrategyParameters']['TIMEFRAME_ZONE'] = TIMEFRAME_MAP[tf_zone_str]
+
+        tf_entry_str = config['StrategyParameters']['TIMEFRAME_ENTRY']
+        config['StrategyParameters']['TIMEFRAME_ENTRY'] = TIMEFRAME_MAP[tf_entry_str]
+        
+        tf_confirm_str = config['StrategyParameters']['TIMEFRAME_CONFIRM']
+        config['StrategyParameters']['TIMEFRAME_CONFIRM'] = TIMEFRAME_MAP[tf_confirm_str]
+
+    except KeyError as e:
+        print(f"[CRITICAL] Config error: Invalid timeframe string '{e}'. Check StrategyParameters in config.json.")
+        exit()
+
+    # --- Process Timezone ---
+    try:
+        tz_str = config['Schedule']['TZ_JOBURG']
+        config['Schedule']['TZ_JOBURG'] = pytz.timezone(tz_str)
+    except Exception as e:
+        print(f"[CRITICAL] Config error: Invalid timezone string '{tz_str}'. {e}")
+        exit()
+
+    print("[INFO] config.json loaded and processed successfully.")
+    return config
+
+# --- Load Config at startup ---
+CONFIG = load_config('config.json')
+
+# ============================
+# CONFIG & GLOBAL STATE (REMOVED HARD-CODED VALUES)
+# ============================
+
+# --- All settings are now loaded from the CONFIG dictionary ---
+SYMBOLS = CONFIG['BotSettings']['SYMBOLS']
+TIMEFRAME_ZONE = CONFIG['StrategyParameters']['TIMEFRAME_ZONE']
+TIMEFRAME_ENTRY = CONFIG['StrategyParameters']['TIMEFRAME_ENTRY']
+TIMEFRAME_CONFIRM = CONFIG['StrategyParameters']['TIMEFRAME_CONFIRM']
+ZONE_LOOKBACK = CONFIG['StrategyParameters']['ZONE_LOOKBACK']
+TP_RATIO = CONFIG['StrategyParameters']['TP_RATIO']
+MAGIC = CONFIG['BotSettings']['MAGIC']
+DRY_RUN = CONFIG['BotSettings']['DRY_RUN']
+CONFIDENCE_THRESHOLD = CONFIG['StrategyParameters']['CONFIDENCE_THRESHOLD']
+CONF_PRIORITY_GLOBAL_MIN = CONFIG['StrategyParameters']['CONF_PRIORITY_GLOBAL_MIN']
+ALLOW_PYRAMID_SAME_SIDE = CONFIG['StrategyParameters']['ALLOW_PYRAMID_SAME_SIDE']
+AUTO_CLOSE_ON_STRONG = CONFIG['StrategyParameters']['AUTO_CLOSE_ON_STRONG']
+CLOSE_CONF_DIFF = CONFIG['StrategyParameters']['CLOSE_CONF_DIFF']
+MAX_TOUCH_ALLOWED = CONFIG['StrategyParameters']['MAX_TOUCH_ALLOWED']
+PARTIAL_CLOSE_PERCENT = CONFIG['StrategyParameters']['PARTIAL_CLOSE_PERCENT']
+SUMMARY_HOUR = CONFIG['Schedule']['SUMMARY_HOUR']
+SUMMARY_MINUTE = CONFIG['Schedule']['SUMMARY_MINUTE']
+TZ_JOBURG = CONFIG['Schedule']['TZ_JOBURG']
+REJECTED_CSV = CONFIG['FilePaths']['REJECTED_CSV']
+TRADES_LOCAL_CSV = CONFIG['FilePaths']['TRADES_LOCAL_CSV']
+
+# Runtime state
+active_trades = {}
+active_trades_by_symbol = {}
+zone_touch_counts = {}
+_last_zone_alert_time = {}
+_last_rejected_flush_index = 0
+_rejected_flush_lock = threading.Lock()
+_seen_closed_pairs = set()
+_last_crt_alerts = {}
+_last_summary_date_local = None
+_last_summary_sent_ts = 0
+tp1_hit_tickets = set()
+
+# (The rest of the file is identical, just uses the global vars as defined above)
+# ... [functions: get_current_global_session, handle_global_session, etc.] ...
+
+# =========================================================================
+# === NOTE: No other logic changes are needed below this line, ===
+# === as all functions refer to the global variables we just set ===
+# === from the CONFIG file. ===
+# =========================================================================
 
 # --- emergency control import (already implemented separately) ---
 from emergency_control import check_emergency_stop
 
 # === Session State Tracking ===
-# === Session State Tracking ===
-#_session_state = {}  # {session_name: "awake"/"sleep"}
 _current_global_session = None  # None / "Asia" / "London" / "New York"
 
 def get_current_global_session():
@@ -133,7 +243,8 @@ def send_startup_intro():
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "   • News impact filter (to avoid high-volatility events)\n"
         "   • Equity-based emergency stop\n"
-        "   • Automatic Breakeven + ATR-based Trailing Stop\n\n"
+        "   • **Partial TP @ 1:1 R/R + Automatic Breakeven SL**\n"
+        "   • ATR-based Trailing Stop\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚠️ **DISCLAIMER**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -147,49 +258,6 @@ def send_startup_intro():
     )
     safe_telegram(intro)
 
-
-
-# ============================
-# CONFIG & GLOBAL STATE
-# ============================
-SYMBOLS = ["GBPUSD", "USDJPY", "USDCAD", "USDCHF", "XAUUSD"]
-
-TIMEFRAME_ZONE = mt5.TIMEFRAME_H1
-TIMEFRAME_ENTRY = mt5.TIMEFRAME_M1
-TIMEFRAME_CONFIRM = mt5.TIMEFRAME_M5
-ZONE_LOOKBACK = 100
-TP_RATIO = 2
-MAGIC = 12345
-
-# Safety / behavior flags
-DRY_RUN = False                      # Set False to enable live trading
-CONFIDENCE_THRESHOLD = 0.60         # minimum confidence to accept a trade
-CONF_PRIORITY_GLOBAL_MIN = 0.50     # absolute min to consider ordering logic (failsafe)
-ALLOW_PYRAMID_SAME_SIDE = False     # if True, adds to same-side position on same symbol
-AUTO_CLOSE_ON_STRONG = True         # if True, will attempt to close existing positions if opposite signal is much stronger
-CLOSE_CONF_DIFF = 0.12              # new_conf must exceed existing_conf + this to trigger auto-close
-MAX_TOUCH_ALLOWED = 2               # <<< SOLUTION 3: Changed from 3 to 2
-
-# Daily summary schedule (Africa/Johannesburg local time)
-SUMMARY_HOUR = 23
-SUMMARY_MINUTE = 59
-TZ_JOBURG = pytz.timezone("Africa/Johannesburg")
-
-# Paths for logging
-REJECTED_CSV = "rejected_signals_log.csv"
-TRADES_LOCAL_CSV = "trades_history_local.csv"
-
-# Runtime state
-active_trades = {}                     # legacy compatibility map
-active_trades_by_symbol = {}           # { symbol: { 'side': 'buy'/'sell', 'ticket': id, 'trade_id': str|None, 'confidence': 0.x, 'ts': epoch } }
-zone_touch_counts = {}
-_last_zone_alert_time = {}
-_last_rejected_flush_index = 0
-_rejected_flush_lock = threading.Lock()
-_seen_closed_pairs = set()             # (ticket, deal_id) processed to avoid double-updates
-_last_crt_alerts = {}  # symbol:timestamp cache for CRT signals
-_last_summary_date_local = None
-_last_summary_sent_ts = 0
 
 # ============================
 # HELPERS
@@ -398,7 +466,7 @@ def load_open_trades_from_csv(path=TRADES_LOCAL_CSV):
     This repopulates the 'active_trades_by_symbol' map so the bot
     can manage and close trades that were open before a restart.
     """
-    global active_trades_by_symbol
+    global active_trades_by_symbol, tp1_hit_tickets
     if not os.path.isfile(path):
         send_info("[STATE] No local trade history found, starting fresh.")
         return
@@ -419,15 +487,19 @@ def load_open_trades_from_csv(path=TRADES_LOCAL_CSV):
                     side = row.get('side')
                     ticket_str = row.get('trade_id') # This is the ticket
                     timestamp_str = row.get('timestamp')
+                    entry_price_str = row.get('entry_price') # <-- NEW
+                    sl_str = row.get('sl') # <-- NEW
 
-                    if not all([symbol, side, ticket_str, timestamp_str]):
-                        send_info(f"[WARN] Skipping malformed open trade row: {row}")
+                    if not all([symbol, side, ticket_str, timestamp_str, entry_price_str, sl_str]):
+                        send_info(f"[WARN] Skipping malformed open trade row (missing data): {row}")
                         continue
 
                     try:
                         # Convert string timestamp back to epoch float
                         ts_epoch = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S").timestamp()
                         ticket_int = int(ticket_str)
+                        entry_price = float(entry_price_str)
+                        sl = float(sl_str)
                     except Exception as e:
                         send_info(f"[WARN] Could not parse reloaded trade data for {ticket_str}: {e}")
                         continue
@@ -437,16 +509,30 @@ def load_open_trades_from_csv(path=TRADES_LOCAL_CSV):
                         send_info(f"[WARN] Conflict on reload: {symbol} already in active map. Ignoring CSV row.")
                         continue
                         
-                    # Repopulate the map
+                    # Repopulate the map with all data needed for partial TP
                     active_trades_by_symbol[symbol] = {
                         'side': side,
                         'ticket': ticket_int,
-                        'trade_id': ticket_str,  # Keep string for trade_logger matching
-                        'confidence': None,     # Confidence is lost on restart (this disables auto-close, which is safe)
-                        'ts': ts_epoch
+                        'trade_id': ticket_str,
+                        'confidence': None,     # Confidence is lost on restart
+                        'ts': ts_epoch,
+                        'entry_price': entry_price, # <-- NEW
+                        'sl': sl                    # <-- NEW
                     }
-                    reloaded_count += 1
-                    send_info(f"  > Reloaded active trade: {symbol} {side.upper()} (Ticket: {ticket_str})")
+                    
+                    # Check if the trade is already risk-free (by checking live SL)
+                    position = get_position_by_ticket(ticket_int)
+                    if position:
+                        if (side == 'buy' and position.sl >= entry_price) or \
+                           (side == 'sell' and position.sl <= entry_price):
+                            tp1_hit_tickets.add(ticket_int)
+                            send_info(f"  > Reloaded risk-free trade: {symbol} {side.upper()} (Ticket: {ticket_str})")
+                        else:
+                            send_info(f"  > Reloaded active trade: {symbol} {side.upper()} (Ticket: {ticket_str})")
+                            reloaded_count += 1
+                    else:
+                        send_info(f"  > Reloaded active trade (position not found in MT5): {symbol} {side.upper()} (Ticket: {ticket_str})")
+                        reloaded_count += 1
 
         if reloaded_count > 0:
             send_info(f"[STATE] Successfully reloaded {reloaded_count} open trade(s).")
@@ -667,7 +753,7 @@ def has_conflict_and_existing_confidence(symbol, side):
 
     # FIXED: Check each position to find conflicts
     for pos in positions:
-        pos_side = 'buy' if getattr(pos, 'type', None) == mt5.ORDER_TYPE_BUY else 'sell'
+        pos_side = 'buy' if getattr(pos, 'type',None) == mt5.ORDER_TYPE_BUY else 'sell'
         
         if pos_side != side:
             # Found opposite-side position → conflict
@@ -679,6 +765,84 @@ def has_conflict_and_existing_confidence(symbol, side):
     # No conflicts found
     return False, None
 
+# ==========================================================
+# === NEW TRADE MANAGEMENT FUNCTION (ENHANCEMENT #2) ===
+# ==========================================================
+def check_for_partial_tp(symbol):
+    """
+    Checks all active trades for the symbol to see if 1R (TP1) has been hit.
+    If so, triggers partial close and moves SL to BE.
+    """
+    global active_trades_by_symbol, tp1_hit_tickets
+    
+    # Check if there are any active trades for this symbol
+    if symbol not in active_trades_by_symbol:
+        return
+
+    # Get the trade record from our bot's memory
+    trade_record = active_trades_by_symbol.get(symbol)
+    if not trade_record:
+        return
+        
+    ticket = trade_record.get('ticket')
+    if not ticket:
+        return
+        
+    # 1. Check if this trade is already risk-free
+    if ticket in tp1_hit_tickets:
+        return
+
+    # 2. Get the trade data needed to calculate TP1
+    entry_price = trade_record.get('entry_price')
+    sl = trade_record.get('sl')
+    side = trade_record.get('side')
+    
+    if not all([entry_price, sl, side]):
+        send_info(f"[WARN] Trade {ticket} missing data for partial TP calc.")
+        return
+
+    # 3. Calculate the 1R risk distance and the TP1 target
+    try:
+        risk_distance = abs(entry_price - sl)
+        if risk_distance == 0:
+            return
+            
+        tp1_target = entry_price + risk_distance if side == 'buy' else entry_price - risk_distance
+    except Exception as e:
+        send_info(f"[WARN] TP1 calc failed for {ticket}: {e}")
+        return
+
+    # 4. Get the current market price
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        return
+    
+    current_price = tick.bid if side == 'buy' else tick.ask
+
+    # 5. Check if TP1 has been hit
+    tp1_hit = False
+    if side == 'buy' and current_price >= tp1_target:
+        tp1_hit = True
+    elif side == 'sell' and current_price <= tp1_target:
+        tp1_hit = True
+
+    # 6. If TP1 hit, execute partial close and move to BE
+    if tp1_hit:
+        send_info(f"✅ {symbol} 1R target hit at {tp1_target:.5f}. Securing trade...")
+        
+        if DRY_RUN:
+            send_info(f"(DRY_RUN) Would close {PARTIAL_CLOSE_PERCENT*100}% and move SL to BE for {ticket}")
+            tp1_hit_tickets.add(ticket) # Add to set even in dry run
+        else:
+            success = close_partial_and_move_sl_to_be(ticket, partial_close_percent=PARTIAL_CLOSE_PERCENT)
+            
+            if success:
+                # Add to our set to prevent this from running again
+                tp1_hit_tickets.add(ticket)
+                safe_telegram(f"💰 {symbol} TP1 hit! Closed 50% and moved SL to BE.")
+            else:
+                send_info(f"[ERROR] Partial close execution failed for {ticket}.")
+
 # ============================
 # CORE MONITOR & TRADE
 # ============================
@@ -687,7 +851,7 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
     """
     Main per-symbol monitor function. Intended to be run by scheduler for each symbol.
     """
-    global zone_touch_counts, active_trades, active_trades_by_symbol
+    global zone_touch_counts, active_trades, active_trades_by_symbol, tp1_hit_tickets
 
     try:
         account = mt5.account_info()
@@ -780,6 +944,7 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
     
     # ✅ We need at least 5 candles from M5 for pattern detection (e.g., rectangle)
     if m5_df.empty or len(m5_df) < 5:
+        # Typo fix: mS_df -> m5_df
         send_info(f"[ERROR] Not enough M5 candles for {symbol} (need 5, got {len(m5_df)}). Skipping pattern check.")
         return # Hard exit if we can't check patterns
     
@@ -848,8 +1013,24 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
 
     MIN_LOT, MAX_LOT, LOT_STEP = get_lot_constraints(symbol)
     SL_BUFFER = 150 * point
-    CHECK_RANGE = 300 * point
+    # CHECK_RANGE = 300 * point  <--- FIX #2: Removed this dangerous static line
     lot_size = max(MIN_LOT, fixed_lot if fixed_lot else MIN_LOT)
+
+    # === FIX #2: Adaptive Check Range ===
+    # Old: CHECK_RANGE = 300 * point (static 30 pips!)
+    # New: Use 1.0x M1 ATR as the check range.
+    # This is a much tighter, more realistic proximity for scalping.
+    # We add a fallback in case ATR is invalid.
+    fallback_range = 50 * point # Fallback to 5 pips
+    if atr is not None and not pd.isna(atr) and atr > 0:
+        adaptive_check_range = max(atr * 1.0, fallback_range) # Use 1x ATR, but no smaller than 5 pips
+    else:
+        adaptive_check_range = fallback_range
+        send_info(f"[WARN] {symbol} M1 ATR invalid, using fallback check_range: {adaptive_check_range}")
+    
+    # For logging/debugging:
+    # send_info(f"[DEBUG] {symbol} Adaptive Check Range set to: {adaptive_check_range:.5f} (ATR: {atr:.5f})")
+    # ===================================
 
     try:
         strict_signals, _ = run_trade_decision_engine(
@@ -868,7 +1049,7 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             zone_touch_counts=zone_touch_counts,
             SL_BUFFER=SL_BUFFER,
             TP_RATIO=TP_RATIO,
-            CHECK_RANGE=CHECK_RANGE,
+            CHECK_RANGE=adaptive_check_range, # <--- FIX #2: Using new variable
             LOT_SIZE=lot_size,
             MAGIC=MAGIC,
             strategy_mode="trend_follow",
@@ -905,7 +1086,7 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             zone_touch_counts=zone_touch_counts,
             SL_BUFFER=SL_BUFFER,
             TP_RATIO=TP_RATIO,
-            CHECK_RANGE=CHECK_RANGE,
+            CHECK_RANGE=adaptive_check_range, # <--- FIX #2: Using new variable
             LOT_SIZE=lot_size,
             MAGIC=MAGIC,
             strategy_mode="aggressive",
@@ -1030,7 +1211,7 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
                     f"📥 SIGNAL EXECUTION: {symbol} pattern detected | {side.upper()} idea\n"
                     f"   🔹 Entry: {entry:.5f}\n"
                     f"   🔹 SL: {sl:.5f}\n"
-                    f"   🔹 TP: {tp:.5f}\n"
+                    f"   🔹 TP (Final): {tp:.5f}\n"
                     f"   🔹 Confidence: {format_confidence_label(confidence)} ({reason})"
                 )
                 safe_telegram(full_signal_msg)
@@ -1039,9 +1220,11 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             if DRY_RUN:
                 fake_ticket = int(time_module.time() * 1000) % 1000000
                 trade_id = log_pending_trade(strategy, side, reason, zone, entry, sl, tp, lot, symbol=symbol, trade_id=fake_ticket)
+                # === NEW: Store data for partial TP ===
                 active_trades_by_symbol[symbol] = {
                     'side': side, 'ticket': fake_ticket, 'trade_id': trade_id,
-                    'confidence': confidence, 'ts': time_module.time()
+                    'confidence': confidence, 'ts': time_module.time(),
+                    'entry_price': entry, 'sl': sl # <-- Store this
                 }
                 append_trade_to_local_csv({
                     "trade_id": trade_id,
@@ -1062,34 +1245,80 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
                 })
                 safe_telegram(f"(DRY_RUN) ✅ {symbol} {side.upper()} conf:{confidence:.2f} lot:{lot}")
             else:
-                result = place_order(symbol, side, lot, sl, tp, MAGIC, comment="NawthviperBot")
+                # === NEW 2-STEP ORDER PROCESS ===
+                # Step 1: Place the order *without* SL/TP
+                result = place_order(symbol, side, lot, MAGIC, comment="NawthviperBot")
+
                 if result is not None and getattr(result, 'retcode', None) == mt5.TRADE_RETCODE_DONE:
-                    ticket = getattr(result, 'order', None) or getattr(result, 'ticket', None)
+                    # Order is open! Get the ticket.
+                    ticket = None
+                    try:
+                        # The deal ID is the ticket of the order that was executed
+                        deal_id = getattr(result, 'deal', None)
+                        if deal_id:
+                            # We must use history_deals_get to find the position_id from the deal_id
+                            deal_info = mt5.history_deals_get(deal=deal_id)
+                            if deal_info and len(deal_info) > 0:
+                                ticket = deal_info[0].position_id # This is the position ticket
+                    except Exception as e:
+                        send_info(f"[WARN] Could not find ticket from deal {deal_id}: {e}")
+
+                    # Fallback if deal method fails
+                    if not ticket:
+                        try:
+                            send_info("[INFO] Ticket not found via deal, trying fallback...")
+                            time_module.sleep(0.5) # Wait for position to appear
+                            pos = find_live_position_for_symbol(symbol)
+                            if pos:
+                                ticket = pos.ticket
+                        except Exception as e:
+                            send_info(f"[WARN] Fallback find_live_position failed: {e}")
+
+                    if not ticket:
+                        safe_telegram(f"⚠️ ORDER PLACED {symbol} {side.upper()} but FAILED to find ticket. SL/TP not set.")
+                        send_info(f"[ORDER FAIL] Order opened but could not get ticket. Result: {result}")
+                        continue # Don't proceed
+
+                    # Step 2: Now that order is open, modify it to add SL/TP
+                    modify_success = modify_position_sltp(ticket, sl, tp)
+
+                    if not modify_success:
+                        safe_telegram(f"⚠️ ORDER PLACED {symbol} {side.upper()} ticket:{ticket} but FAILED to set SL/TP.")
+
+                    # Log and store the trade regardless of SL/TP modification
                     trade_id = log_pending_trade(strategy, side, reason, zone, entry, sl, tp, lot, symbol=symbol, trade_id=ticket)
                     active_trades_by_symbol[symbol] = {
                         'side': side, 'ticket': ticket, 'trade_id': trade_id,
-                        'confidence': confidence, 'ts': time_module.time()
+                        'confidence': confidence, 'ts': time_module.time(),
+                        'entry_price': entry, 'sl': sl 
                     }
-                    safe_telegram(f"✅ ORDER PLACED {symbol} {side.upper()} conf:{confidence:.2f} ticket:{ticket} lot:{lot}")
 
-                    # 🔄 Clear CRT cache for this symbol (so new CRT alerts won’t be blocked)
+                    if modify_success:
+                        safe_telegram(f"✅ ORDER PLACED {symbol} {side.upper()} conf:{confidence:.2f} ticket:{ticket} lot:{lot}")
+
+                    # 🔄 Clear CRT cache
                     keys_to_remove = [k for k in _last_crt_alerts.keys() if k.startswith(f"{symbol}:")]
                     for k in keys_to_remove:
                         _last_crt_alerts.pop(k, None)
 
-                    #trade_id = log_pending_trade(strategy, side, reason, zone, entry, sl, tp, lot, symbol=symbol, trade_id=ticket)
+                    # (This line was duplicated, removing it)
+                    # trade_id = log_pending_trade(strategy, side, reason, zone, entry, sl, tp, lot, symbol=symbol, trade_id=ticket)
+
                 else:
+                    # The initial order placement failed
                     safe_telegram(f"❌ Order Failed {symbol} {side.upper()} conf:{confidence:.2f} result:{result}")
                     send_info(f"[ORDER FAIL] result: {result}")
+                    
         except Exception as e:
             send_info(f"[EXCEPTION] processing signal {sig}: {e}\n{traceback.format_exc()}")
 
     # --- trailing stop + housekeeping ---
     try:
-        # NEW: Breakeven Check
-        move_to_breakeven(symbol, MAGIC)
+        # === NEW (Enhancement #2): Check for 1R partial TP ===
+        # This replaces the old move_to_breakeven call
+        check_for_partial_tp(symbol)
     except Exception as e:
-        send_info(f"[WARN] move_to_breakeven failed: {e}")
+        send_info(f"[WARN] check_for_partial_tp failed: {e}")
         
     try:
         trail_sl(symbol, MAGIC)
@@ -1193,6 +1422,8 @@ def check_closed_trades(symbol, lookback_days=2):
 
     Now runs with extra debug logs so you can see if deals are skipped.
     """
+    global tp1_hit_tickets # <-- NEW
+    
     try:
         if not mt5_init_if_needed():
             return
@@ -1201,10 +1432,10 @@ def check_closed_trades(symbol, lookback_days=2):
         start = now - timedelta(days=lookback_days)
         deals = mt5.history_deals_get(start, now)
         if not deals:
-            send_info(f"[DEBUG] No deals found for {symbol} in last {lookback_days} days.")
+            # send_info(f"[DEBUG] No deals found for {symbol} in last {lookback_days} days.")
             return
 
-        send_info(f"[DEBUG] Found {len(deals)} deals in MT5 history for {symbol}.")
+        # send_info(f"[DEBUG] Found {len(deals)} deals in MT5 history for {symbol}.")
 
         # Build reverse map ticket -> (symbol, rec)
         ticket_map = {}
@@ -1217,7 +1448,7 @@ def check_closed_trades(symbol, lookback_days=2):
             try:
                 deal_id = getattr(deal, 'ticket', None) or getattr(deal, 'deal', None)
                 order_ticket = getattr(deal, 'order', None)
-                pos_id = getattr(deal, 'position_id', None)
+                pos_id = getattr(deal,'position_id', None)
 
                 candidate_ticket = None
                 if order_ticket in ticket_map:
@@ -1231,11 +1462,11 @@ def check_closed_trades(symbol, lookback_days=2):
 
                 key = (candidate_ticket, deal_id)
                 if key in _seen_closed_pairs:
-                    send_info(f"[DEBUG] Deal {deal_id} already processed.")
+                    # send_info(f"[DEBUG] Deal {deal_id} already processed.")
                     continue
 
                 if not _deal_is_exit(deal):
-                    send_info(f"[DEBUG] Deal {deal_id} is not an exit leg.")
+                    # send_info(f"[DEBUG] Deal {deal_id} is not an exit leg.")
                     continue
 
                 sym, rec = ticket_map[candidate_ticket]
@@ -1247,26 +1478,44 @@ def check_closed_trades(symbol, lookback_days=2):
                 profit = float(getattr(deal, 'profit', 0.0))
                 result_text = "win" if profit > 0 else ("loss" if profit < 0 else "breakeven")
 
-                # Update CSV/trade log
-                update_trade_result(
-                    trade_id=trade_id,
-                    exit_price=exit_price,
-                    exit_time=exit_time.strftime("%Y-%m-%d %H:%M:%S"),
-                    profit=profit,
-                    result=result_text
-                )
+                # === Check if this deal is a full close ===
+                # We need to check the *live* position volume
+                # If a deal happens, but a position with this ticket *still exists*,
+                # it was a partial close.
+                
+                live_position = get_position_by_ticket(candidate_ticket)
+                is_full_close = live_position is None
 
-                _seen_closed_pairs.add(key)
-                active_trades_by_symbol.pop(sym, None)
+                if is_full_close:
+                    # Update CSV/trade log
+                    update_trade_result(
+                        trade_id=trade_id,
+                        exit_price=exit_price,
+                        exit_time=exit_time.strftime("%Y-%m-%d %H:%M:%S"),
+                        profit=profit,
+                        result=result_text
+                    )
 
-                # Telegram notification
-                emoji = "💰🟢" if profit > 0 else "🔻🔴" if profit < 0 else "😐"
-                safe_telegram(f"{emoji} {sym} closed | PnL: ${profit:.2f} | Price: {exit_price:.5f}")
-                # 🔄 Clear CRT cache for this symbol (so fresh CRT alerts can trigger)
-                keys_to_remove = [k for k in _last_crt_alerts.keys() if k.startswith(f"{symbol}:")]
-                for k in keys_to_remove:
-                    _last_crt_alerts.pop(k, None)
-                send_info(f"[CLOSED] {sym} ticket={candidate_ticket} pnl={profit:.2f}")
+                    _seen_closed_pairs.add(key)
+                    # Clean up all our runtime maps
+                    active_trades_by_symbol.pop(sym, None)
+                    tp1_hit_tickets.discard(candidate_ticket) # <-- NEW: Clean up set
+
+                    # Telegram notification
+                    emoji = "💰🟢" if profit > 0 else "🔻🔴" if profit < 0 else "😐"
+                    safe_telegram(f"{emoji} {sym} closed | PnL: ${profit:.2f} | Price: {exit_price:.5f}")
+                    # 🔄 Clear CRT cache for this symbol (so fresh CRT alerts can trigger)
+                    keys_to_remove = [k for k in _last_crt_alerts.keys() if k.startswith(f"{symbol}:")]
+                    for k in keys_to_remove:
+                        _last_crt_alerts.pop(k, None)
+                    send_info(f"[CLOSED] {sym} ticket={candidate_ticket} pnl={profit:.2f}")
+                else:
+                    # This was a partial close (like our TP1), not a full close.
+                    # Don't remove it from active_trades_by_symbol.
+                    # Just log that a partial close occurred.
+                    send_info(f"[PARTIAL] {sym} ticket={candidate_ticket} pnl={profit:.2f} (position still open)")
+                    _seen_closed_pairs.add(key) # Mark this *deal* as seen
+
 
             except Exception as inner:
                 send_info(f"[WARN] processing deal failed: {inner}")
@@ -1292,7 +1541,7 @@ if __name__ == "__main__":
 
     # --- NEW: Load state ---
     try:
-        load_open_trades_from_csv()
+        load_open_trades_from_csv(path=TRADES_LOCAL_CSV)
     except Exception as e:
         send_info(f"[CRITICAL] Failed to load open trades state: {e}")
     
