@@ -7,4 +7,4 @@ python-dotenv
 pytz
 requests
 numpy<2.0
-tradingeconomics
+beautifulsoup4

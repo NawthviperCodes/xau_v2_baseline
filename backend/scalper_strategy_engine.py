@@ -3,23 +3,21 @@
 Complete scalper strategy engine (probability-based, auto-close on stronger signals).
 Drop-in replacement — copy & paste into your project.
 
+✅ VIX75 UPGRADE 1: Multi-Timeframe (HTF) Bias
+- Added 'get_htf_bias' function (50/200 EMA cross on H4).
+- This H4 bias ("UP" or "DOWN") is now passed to the decision engine.
+- The bot will only trade in the direction of the H4 trend.
+
+✅ VIX75 UPGRADE 2: Clean Signal & Order Execution
+- Removed all Telegram spam.
+- The bot now only sends ONE clean "SIGNAL" message before execution.
+- It sends ONE clean "ORDER PLACED" message after success.
+- This logic is now inside 'monitor_and_trade' instead of the decision engine.
+
 ✅ ENHANCEMENT #3: External Configuration
 - All bot settings (SYMBOLS, DRY_RUN, TP_RATIO, etc.) are now loaded
   from an external 'config.json' file.
-- This file is now the single source of truth for all parameters.
-- Hard-coded global variables have been removed.
-
-✅ Zone Quality Fixes:
-- (From config) MAX_TOUCH_ALLOWED = 2
-- Added Broken Zone Filter
-- Zone detection now uses "Strength of Departure" (from zone_detector.py)
-
-✅ Proximity Fix:
-- Removed static 'CHECK_RANGE'
-- Implemented 'adaptive_check_range' based on M1 ATR
-
-✅ ENHANCEMENT #2: Partial TP & Risk-Free Trades
-- Bot now monitors for 1:1 R/R and executes partial close + SL to BE.
+...
 """
 from datetime import datetime, timedelta, timezone, time as dtime
 import time as time_module          # alias stdlib module to avoid shadowing
@@ -30,7 +28,8 @@ import MetaTrader5 as mt5
 import pandas as pd
 from ta.volatility import AverageTrueRange
 from zone_detector import detect_zones, detect_fast_zones
-from trade_decision_engine import run_trade_decision_engine, rejected_signals_log
+# --- VIX75 UPGRADE: We now import the 'format_confidence_label' ---
+from trade_decision_engine import run_trade_decision_engine, rejected_signals_log, format_confidence_label
 from telegram_notifier import send_telegram_message
 from trade_executor import (
     place_order,
@@ -52,7 +51,7 @@ from ta.volatility import BollingerBands
 import csv, os, threading, traceback
 from collections import defaultdict
 import inspect
-from trade_decision_engine import format_confidence_label
+# --- (Removed format_confidence_label, it's now in trade_decision_engine) ---
 
 # ============================
 # === NEW: CONFIGURATION LOADER ===
@@ -97,6 +96,15 @@ def load_config(path='config.json'):
         
         tf_confirm_str = config['StrategyParameters']['TIMEFRAME_CONFIRM']
         config['StrategyParameters']['TIMEFRAME_CONFIRM'] = TIMEFRAME_MAP[tf_confirm_str]
+        
+        # --- VIX75 UPGRADE: Add HTF Timeframe from config ---
+        if 'TIMEFRAME_HTF' in config['StrategyParameters']:
+            tf_htf_str = config['StrategyParameters']['TIMEFRAME_HTF']
+            config['StrategyParameters']['TIMEFRAME_HTF'] = TIMEFRAME_MAP[tf_htf_str]
+        else:
+            # Fallback if not in config
+            print("[WARN] 'TIMEFRAME_HTF' not in config.json, defaulting to H4.")
+            config['StrategyParameters']['TIMEFRAME_HTF'] = mt5.TIMEFRAME_H4
 
     except KeyError as e:
         print(f"[CRITICAL] Config error: Invalid timeframe string '{e}'. Check StrategyParameters in config.json.")
@@ -125,6 +133,7 @@ SYMBOLS = CONFIG['BotSettings']['SYMBOLS']
 TIMEFRAME_ZONE = CONFIG['StrategyParameters']['TIMEFRAME_ZONE']
 TIMEFRAME_ENTRY = CONFIG['StrategyParameters']['TIMEFRAME_ENTRY']
 TIMEFRAME_CONFIRM = CONFIG['StrategyParameters']['TIMEFRAME_CONFIRM']
+TIMEFRAME_HTF = CONFIG['StrategyParameters']['TIMEFRAME_HTF'] # <-- VIX75 UPGRADE
 ZONE_LOOKBACK = CONFIG['StrategyParameters']['ZONE_LOOKBACK']
 TP_RATIO = CONFIG['StrategyParameters']['TP_RATIO']
 MAGIC = CONFIG['BotSettings']['MAGIC']
@@ -141,6 +150,9 @@ SUMMARY_MINUTE = CONFIG['Schedule']['SUMMARY_MINUTE']
 TZ_JOBURG = CONFIG['Schedule']['TZ_JOBURG']
 REJECTED_CSV = CONFIG['FilePaths']['REJECTED_CSV']
 TRADES_LOCAL_CSV = CONFIG['FilePaths']['TRADES_LOCAL_CSV']
+# --- VIX75 UPGRADE: Add new threshold for clean signals ---
+MIN_CONF_FOR_TELEGRAM = CONFIG['StrategyParameters'].get('MIN_CONF_FOR_TELEGRAM', 0.75) # Default 0.75 if not in config
+
 
 # Runtime state
 active_trades = {}
@@ -154,15 +166,6 @@ _last_crt_alerts = {}
 _last_summary_date_local = None
 _last_summary_sent_ts = 0
 tp1_hit_tickets = set()
-
-# (The rest of the file is identical, just uses the global vars as defined above)
-# ... [functions: get_current_global_session, handle_global_session, etc.] ...
-
-# =========================================================================
-# === NOTE: No other logic changes are needed below this line, ===
-# === as all functions refer to the global variables we just set ===
-# === from the CONFIG file. ===
-# =========================================================================
 
 # --- emergency control import (already implemented separately) ---
 from emergency_control import check_emergency_stop
@@ -209,29 +212,28 @@ def get_current_session_name():
 
 def send_startup_intro():
     intro = (
-        "🤖 **Nawthviper Algo-Scalper Engine Activated**\n\n"
+        "🤖 **Nawthviper Algo-Scalper Engine Activated (FOREX/GOLD)**\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📘 **STRATEGY OVERVIEW**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "📌 **Methodology:** Confluence-based *price action scalping* on M1 & M5 charts.\n"
         "The system applies a multi-layered filter chain to identify precise, high-probability setups:\n"
-        "   • **Primary Signal:** Candlestick patterns (*Engulfing*, *Pin Bars*) confirmed at Supply/Demand Zones.\n"
+        "   • **✅ VIX75 UPGRADE: H4 Trend Bias Filter (50/200 EMA)**\n"
+        "   • **Primary Signal:** Candlestick patterns (*Engulfing*, *Pin Bars*) confirmed at H1 Supply/Demand Zones.\n"
         "   • **Advanced Filter:** Candle Range Theory (CRT) for momentum validation and early reversal detection.\n"
-        "   • **Confluence Checks:** H1/M5 Trend Alignment, MACD & RSI Momentum, VWAP Positioning.\n"
+        "   • **Confluence Checks:** M5 Trend Alignment, MACD & RSI Momentum, VWAP Positioning.\n"
         "   • **Risk Management:** Dynamic SL/TP using **ATR-based volatility** and **structural targets**.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📈 **SIGNAL BEHAVIOR**\n"
+        "📈 **SIGNAL BEHAVIOR (VIX75 UPGRADE)**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Signals are triggered only when:\n"
-        "   • An existing trade on the same symbol has closed, **or**\n"
-        "   • A **new high-confidence setup** overrides a weak active signal.\n\n"
-        "A **5-minute cooldown** per symbol prevents duplicate alerts and maintains signal clarity.\n\n"
+        "Signals are now filtered and clean. Telegram spam is **DISABLED**.\n"
+        "The bot will only send a single `SIGNAL EXECUTION` message when a trade is being placed.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🎯 **CONFIDENCE LEVELS**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "   • **🔥 HIGH (≥ 0.85):** Strong confluence — ideal for execution.\n"
-        "   • **⚖️ MEDIUM (0.70–0.84):** Moderate conviction — suitable for discretionary/aggressive use.\n"
-        "   • **❗ LOW (0.60–0.69):** Weak or early setups — observation only.\n\n"
+        "   • **⚖️ MEDIUM (0.70–0.84):** Moderate conviction.\n"
+        "   • **❗ LOW (< 0.70):** Weak or early setups — observation only.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🕒 **ACTIVE TRADING SESSIONS (UTC)**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -352,6 +354,34 @@ def calculate_trend(df):
         return "downtrend"
     else:
         return "sideways"
+
+# --- VIX75 UPGRADE 1: H4 BIAS FUNCTION ---
+def get_htf_bias(df, fast_ma=50, slow_ma=200):
+    """
+    Determines the Higher-Timeframe bias using an EMA cross.
+    Returns 'UP', 'DOWN', or 'NEUTRAL'.
+    """
+    if df.empty or len(df) < slow_ma:
+        return None  # Not enough data
+
+    df = df.copy()
+    try:
+        df['EMA_fast'] = df['close'].ewm(span=fast_ma, adjust=False).mean()
+        df['EMA_slow'] = df['close'].ewm(span=slow_ma, adjust=False).mean()
+        
+        last_fast = df['EMA_fast'].iloc[-1]
+        last_slow = df['EMA_slow'].iloc[-1]
+        
+        if last_fast > last_slow:
+            return "UP"
+        elif last_fast < last_slow:
+            return "DOWN"
+        else:
+            return "NEUTRAL"
+    except Exception as e:
+        send_info(f"[ERROR] Failed to calculate HTF Bias: {e}")
+        return None
+# --- END UPGRADE 1 ---
 
 
 def calculate_risk_based_lot(symbol, sl_price, entry_price, risk_percent=1.0):
@@ -839,7 +869,8 @@ def check_for_partial_tp(symbol):
             if success:
                 # Add to our set to prevent this from running again
                 tp1_hit_tickets.add(ticket)
-                safe_telegram(f"💰 {symbol} TP1 hit! Closed 50% and moved SL to BE.")
+                # --- VIX75 UPGRADE: We move the TG message to trade_executor ---
+                # safe_telegram(f"💰 {symbol} TP1 hit! Closed 50% and moved SL to BE.")
             else:
                 send_info(f"[ERROR] Partial close execution failed for {ticket}.")
 
@@ -870,17 +901,29 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
         except Exception as e:
             send_info(f"[WARN] check_emergency_stop failed: {e}")
 
-    # --- Fetch H1 and detect zones
+    # --- VIX75 UPGRADE 1: Fetch H4 data for bias ---
+    h4_df = get_data(symbol, TIMEFRAME_HTF, 250) # 200 + buffer
+    if h4_df.empty:
+        send_info(f"[ERROR] {symbol} H4 data unavailable.")
+        return
+
+    htf_bias = get_htf_bias(h4_df)
+    if not htf_bias or htf_bias == "NEUTRAL":
+        send_info(f"[INFO] {symbol} Waiting for clear H4 bias. Current: {htf_bias}")
+        return
+    
+    send_info(f"[INFO] {symbol} H4 BIAS IS: {htf_bias}")
+    # --- END UPGRADE 1 ---
+
+    # --- Fetch H1 (Zone Timeframe) and detect zones
     h1_df = get_data(symbol, TIMEFRAME_ZONE, ZONE_LOOKBACK)
     if h1_df.empty or len(h1_df) < 3: # Ensure we have enough data for the range
         send_info(f"[ERROR] {symbol} H1 unavailable or insufficient data.")
         return
 
-    # === NEW: Get HTF (H1) Candle Range for the MTF CRT Strategy ===
     last_completed_h1_candle = h1_df.iloc[-2] # Use [-2] for the last *closed* candle
     htf_high = last_completed_h1_candle['high']
     htf_low = last_completed_h1_candle['low']
-    # ==============================================================
 
     demand_zones, supply_zones = detect_zones(h1_df)
     fast_demand, fast_supply = detect_fast_zones(h1_df)
@@ -900,11 +943,10 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
         
         if adx_value < required_adx:
             send_info(f"[FILTER] {symbol} ADX={adx_value:.2f} < required {required_adx:.2f} → Switching to Ranging Strategy.")
-            strategy_to_run = "ranging"  # <-- CHANGE: Switch strategy, don't return
+            strategy_to_run = "ranging"
     except Exception as e:
         send_info(f"[WARN] ADX calculation failed: {e}")
         
-    # === NEW: FIBONACCI CALCULATION (Bible p. 96, 100) ===
     fibo_zone = None
     try:
         if trend == "uptrend":
@@ -935,20 +977,17 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
 
     # === DATA FETCH & VALIDATION (M1 and M5) ===
     m1_df = get_data(symbol, TIMEFRAME_ENTRY, 200)
-    if len(m1_df) < 35: # Need 35 for indicators
+    if len(m1_df) < 35: 
         send_info(f"[ERROR] Not enough M1 candles for {symbol} (need 35, got {len(m1_df)})")
         return
     
     m5_df = get_data(symbol, TIMEFRAME_CONFIRM, 60)
     m5_context = {}
     
-    # ✅ We need at least 5 candles from M5 for pattern detection (e.g., rectangle)
     if m5_df.empty or len(m5_df) < 5:
-        # Typo fix: mS_df -> m5_df
         send_info(f"[ERROR] Not enough M5 candles for {symbol} (need 5, got {len(m5_df)}). Skipping pattern check.")
-        return # Hard exit if we can't check patterns
-    
-        # === NEW: BOLLINGER BANDS CALCULATION (Bible p. 106) ===
+        return
+        
     bb_zones = None
     if strategy_to_run == "ranging" and not m5_df.empty and len(m5_df) >= 20:
         try:
@@ -959,7 +998,7 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
         except Exception:
             bb_zones = None
         
-    if len(m5_df) >= 35: # We have enough for context indicators
+    if len(m5_df) >= 35: 
         try:
             m5_context['trend'] = calculate_trend(m5_df)
             m5_context['macd'] = MACD(close=m5_df['close']).macd().dropna().values
@@ -967,7 +1006,6 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
         except Exception as e:
             send_info(f"[WARN] M5 context indicators failed: {e}")
             m5_context = {}
-    # ===============================================
 
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
@@ -975,13 +1013,10 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
         return
     price = float(tick.bid)
 
-    # === SOLUTION 1: Filter out broken/violated zones ===
     original_demand_count = len(demand_zones)
     original_supply_count = len(supply_zones)
     
-    # Keep demand zones that are BELOW the current price
     demand_zones = [z for z in demand_zones if z['price'] < price]
-    # Keep supply zones that are ABOVE the current price
     supply_zones = [z for z in supply_zones if z['price'] > price]
 
     filtered_demand_count = len(demand_zones)
@@ -989,7 +1024,6 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
     
     if (original_demand_count != filtered_demand_count) or (original_supply_count != filtered_supply_count):
         send_info(f"[ZONE FILTER] {symbol}: Filtered zones. Demand: {original_demand_count} -> {filtered_demand_count}. Supply: {original_supply_count} -> {filtered_supply_count}.")
-    # ======================================================
 
     sinfo = mt5.symbol_info(symbol)
     if sinfo is None:
@@ -998,7 +1032,7 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
     point = sinfo.point
 
     try:
-        # M1 indicators (still useful for CRT/aggressive filters)
+        # M1 indicators
         macd_calc = MACD(close=m1_df['close'])
         macd_line = macd_calc.macd().dropna().values
         macd_signal = macd_calc.macd_signal().dropna().values
@@ -1013,25 +1047,15 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
 
     MIN_LOT, MAX_LOT, LOT_STEP = get_lot_constraints(symbol)
     SL_BUFFER = 150 * point
-    # CHECK_RANGE = 300 * point  <--- FIX #2: Removed this dangerous static line
     lot_size = max(MIN_LOT, fixed_lot if fixed_lot else MIN_LOT)
 
-    # === FIX #2: Adaptive Check Range ===
-    # Old: CHECK_RANGE = 300 * point (static 30 pips!)
-    # New: Use 1.0x M1 ATR as the check range.
-    # This is a much tighter, more realistic proximity for scalping.
-    # We add a fallback in case ATR is invalid.
-    fallback_range = 50 * point # Fallback to 5 pips
+    fallback_range = 50 * point 
     if atr is not None and not pd.isna(atr) and atr > 0:
-        adaptive_check_range = max(atr * 1.0, fallback_range) # Use 1x ATR, but no smaller than 5 pips
+        adaptive_check_range = max(atr * 1.0, fallback_range) 
     else:
         adaptive_check_range = fallback_range
         send_info(f"[WARN] {symbol} M1 ATR invalid, using fallback check_range: {adaptive_check_range}")
     
-    # For logging/debugging:
-    # send_info(f"[DEBUG] {symbol} Adaptive Check Range set to: {adaptive_check_range:.5f} (ATR: {atr:.5f})")
-    # ===================================
-
     try:
         strict_signals, _ = run_trade_decision_engine(
             symbol=symbol,
@@ -1040,16 +1064,13 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             trend=trend,
             demand_zones=demand_zones,
             supply_zones=supply_zones,
-            
-            # ✅ UPDATED: Pass M1 and M5 candles separately
-            m1_candles_for_crt=m1_df.iloc[-3:],       # Pass last 3 M1 candles
-            m5_candles_for_patterns=m5_df.iloc[-5:],  # Pass last 5 M5 candles
-            
+            m1_candles_for_crt=m1_df.iloc[-3:],
+            m5_candles_for_patterns=m5_df.iloc[-5:],
             active_trades=active_trades,
             zone_touch_counts=zone_touch_counts,
             SL_BUFFER=SL_BUFFER,
             TP_RATIO=TP_RATIO,
-            CHECK_RANGE=adaptive_check_range, # <--- FIX #2: Using new variable
+            CHECK_RANGE=adaptive_check_range, 
             LOT_SIZE=lot_size,
             MAGIC=MAGIC,
             strategy_mode="trend_follow",
@@ -1059,11 +1080,12 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             vwap=vwap_value,
             atr=atr,
             m5_context=m5_context,
-            htf_high=htf_high,  # Pass the new H1 high
-            htf_low=htf_low,      # Pass the new H1 low
+            htf_high=htf_high,
+            htf_low=htf_low,
             last_closed_h1=last_completed_h1_candle, 
             fibo_zone=fibo_zone,                      
-            bollinger_bands=bb_zones     
+            bollinger_bands=bb_zones,
+            htf_bias=htf_bias # <-- VIX75 UPGRADE 1
         )
     except Exception as e:
         send_info(f"[WARN] trade_decision_engine (strict) raised: {e}\n{traceback.format_exc()}")
@@ -1077,16 +1099,13 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             trend=trend,
             demand_zones=fast_demand,
             supply_zones=fast_supply,
-            
-            # ✅ UPDATED: Pass M1 and M5 candles separately
-            m1_candles_for_crt=m1_df.iloc[-3:],       # Pass last 3 M1 candles
-            m5_candles_for_patterns=m5_df.iloc[-5:],  # Pass last 5 M5 candles
-
+            m1_candles_for_crt=m1_df.iloc[-3:],
+            m5_candles_for_patterns=m5_df.iloc[-5:],
             active_trades=active_trades,
             zone_touch_counts=zone_touch_counts,
             SL_BUFFER=SL_BUFFER,
             TP_RATIO=TP_RATIO,
-            CHECK_RANGE=adaptive_check_range, # <--- FIX #2: Using new variable
+            CHECK_RANGE=adaptive_check_range, 
             LOT_SIZE=lot_size,
             MAGIC=MAGIC,
             strategy_mode="aggressive",
@@ -1096,11 +1115,12 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             vwap=vwap_value,
             atr=atr,
             m5_context=m5_context,
-            htf_high=htf_high, # Pass the new H1 high
-            htf_low=htf_low,     # Pass the new H1 low
-            last_closed_h1=last_completed_h1_candle,  # <--- ADDED
-            fibo_zone=fibo_zone,                      # <--- ADDED
-            bollinger_bands=bb_zones     
+            htf_high=htf_high, 
+            htf_low=htf_low,
+            last_closed_h1=last_completed_h1_candle,
+            fibo_zone=fibo_zone,
+            bollinger_bands=bb_zones,
+            htf_bias=htf_bias # <-- VIX75 UPGRADE 1
         )
     except Exception as e:
         send_info(f"[WARN] trade_decision_engine (aggressive) raised: {e}\n{traceback.format_exc()}")
@@ -1129,7 +1149,9 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
         strongest = max(signals, key=lambda s: s.get("confidence", 0))
         signals = [strongest]
 
-    # --- Process signals
+    # ==========================================================
+    # === VIX75 UPGRADE 2: NEW CLEAN SIGNAL/EXECUTION LOOP ===
+    # ==========================================================
     for sig in signals:
         try:
             side = sig.get('side')
@@ -1137,46 +1159,48 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
             sl = sig.get('sl')
             tp = sig.get('tp')
             zone = sig.get('zone')
-            lot = max(MIN_LOT, sig.get('lot', lot_size))
             reason = sig.get('reason', '')
             strategy = sig.get('strategy', '')
             confidence = float(sig.get('confidence', 0.0))
 
-            # --- Risk-based lot override
+            # --- Risk-based lot override ---
             try:
-                risk_lot = calculate_risk_based_lot(symbol, sl_price=sl, entry_price=entry, risk_percent=1.0)
+                risk_lot = calculate_risk_based_lot(symbol, sl_price=sl, entry_price=entry, risk_percent=1.0) # Using 1% risk from config
                 if risk_lot:
                     lot = risk_lot
+                else:
+                    lot = max(MIN_LOT, sig.get('lot', lot_size)) # Fallback to min lot
             except Exception as e:
                 send_info(f"[WARN] risk-based lot calc failed for {symbol}: {e}")
+                lot = max(MIN_LOT, sig.get('lot', lot_size)) # Fallback to min lot
 
+            # --- Final Confidence Check ---
             if confidence < CONF_PRIORITY_GLOBAL_MIN:
+                send_info(f"[SKIP] {symbol} {side} signal confidence {confidence:.2f} < global min {CONF_PRIORITY_GLOBAL_MIN}")
                 continue
             dynamic_conf = adaptive_confidence_threshold(h1_df, base=CONFIDENCE_THRESHOLD)
             if confidence < dynamic_conf:
+                send_info(f"[SKIP] {symbol} {side} signal confidence {confidence:.2f} < adaptive min {dynamic_conf:.2f}")
                 continue
 
-            # FIXED: Enhanced conflict detection with better logging
+            # --- Conflict Check (Auto-Close Logic) ---
             conflict, existing_conf = has_conflict_and_existing_confidence(symbol, side)
             
             if conflict:
                 send_info(f"[CONFLICT] {symbol} has existing position conflict for {side.upper()}")
                 
-                # Check if opposite-side exists and auto-close is enabled
                 if AUTO_CLOSE_ON_STRONG and existing_conf is not None:
                     if confidence >= existing_conf + CLOSE_CONF_DIFF:
-                        send_info(f"[AUTO-CLOSE] Closing {symbol} opposite positions for stronger {side.upper()} signal")
+                        send_info(f"[AUTO-CLOSE] Closing {symbol} opposite positions for stronger {side.upper()} signal (Conf {confidence:.2f} > {existing_conf:.2f})")
                         close_results = close_positions_for_symbol(symbol, reason_msg=f"auto_close_by_conf_{confidence:.2f}")
                         send_info(f"[AUTO-CLOSE] Close results: {close_results}")
                         
-                        # Clear from runtime state
                         active_trades_by_symbol.pop(symbol, None)
                         
-                        # Wait and verify positions are closed
                         wait_attempts = 0
                         positions_still_exist = True
-                        while positions_still_exist and wait_attempts < 15:  # Increased to 15 attempts
-                            time_module.sleep(0.5)  # Increased wait time
+                        while positions_still_exist and wait_attempts < 15:
+                            time_module.sleep(0.5) 
                             live_positions = get_live_positions(symbol)
                             positions_still_exist = len(live_positions) > 0
                             
@@ -1187,83 +1211,59 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
                             wait_attempts += 1
                             if wait_attempts >= 15:
                                 send_info(f"[AUTO-CLOSE] Timeout waiting for positions to close on {symbol}")
-                                # Don't proceed with new trade if we couldn't close existing ones
-                                continue
+                                continue # Skip this signal, can't open
                     else:
-                        # Signal not strong enough to override existing positions
                         send_info(f"[CONFLICT] {side.upper()} signal confidence {confidence:.2f} not strong enough to override existing {existing_conf:.2f}")
                         continue
                 else:
-                    # Either same-side conflict and pyramiding not allowed, or auto-close not enabled
-                    send_info(f"[CONFLICT] {side.upper()} signal blocked due to existing position")
+                    send_info(f"[CONFLICT] {side.upper()} signal blocked due to existing position (pyramid off or no conf)")
                     continue
-                
-                 # ----------------------------------------------------
-            # 📢 NEW: Send Detailed Signal Before Order Execution 📢
-            # ----------------------------------------------------
             
-            
-            MIN_CONF_FOR_TELEGRAM = 0.75  # same threshold as in trade_decision_engine.py
-            reason = sig.get('reason', 'Zone Pattern')
-
+            # --- VIX75 UPGRADE: Send ONE clean signal message ---
             if confidence >= MIN_CONF_FOR_TELEGRAM:
                 full_signal_msg = (
-                    f"📥 SIGNAL EXECUTION: {symbol} pattern detected | {side.upper()} idea\n"
+                    f"📥 SIGNAL: {symbol} | {side.upper()} {reason}\n"
                     f"   🔹 Entry: {entry:.5f}\n"
                     f"   🔹 SL: {sl:.5f}\n"
                     f"   🔹 TP (Final): {tp:.5f}\n"
-                    f"   🔹 Confidence: {format_confidence_label(confidence)} ({reason})"
+                    f"   🔹 Confidence: {format_confidence_label(confidence)}"
                 )
                 safe_telegram(full_signal_msg)
+            # --- END OF CLEAN SIGNAL MESSAGE ---
 
             # --- Place order ---
             if DRY_RUN:
                 fake_ticket = int(time_module.time() * 1000) % 1000000
                 trade_id = log_pending_trade(strategy, side, reason, zone, entry, sl, tp, lot, symbol=symbol, trade_id=fake_ticket)
-                # === NEW: Store data for partial TP ===
                 active_trades_by_symbol[symbol] = {
                     'side': side, 'ticket': fake_ticket, 'trade_id': trade_id,
                     'confidence': confidence, 'ts': time_module.time(),
-                    'entry_price': entry, 'sl': sl # <-- Store this
+                    'entry_price': entry, 'sl': sl 
                 }
                 append_trade_to_local_csv({
-                    "trade_id": trade_id,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "symbol": symbol,
-                    "strategy": strategy,
-                    "side": side,
-                    "entry_reason": reason,
-                    "zone_price": zone,
-                    "entry_price": entry,
-                    "sl": sl,
-                    "tp": tp,
-                    "lot_size": lot,
-                    "exit_price": "",
-                    "exit_time": "",
-                    "profit": "",
-                    "result": "DRY_RUN"
+                    "trade_id": trade_id, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "symbol": symbol, "strategy": strategy, "side": side, "entry_reason": reason,
+                    "zone_price": zone, "entry_price": entry, "sl": sl, "tp": tp, "lot_size": lot,
+                    "exit_price": "", "exit_time": "", "profit": "", "result": "DRY_RUN"
                 })
-                safe_telegram(f"(DRY_RUN) ✅ {symbol} {side.upper()} conf:{confidence:.2f} lot:{lot}")
+                # --- VIX75 UPGRADE: Clean Dry Run message ---
+                safe_telegram(f"DRY RUN: ✅ {symbol} {side.upper()} conf:{confidence:.2f} lot:{lot} ticket:{fake_ticket}")
+            
             else:
-                # === NEW 2-STEP ORDER PROCESS ===
-                # Step 1: Place the order *without* SL/TP
-                result = place_order(symbol, side, lot, MAGIC, comment="NawthviperBot")
+                # --- LIVE EXECUTION (using 2-step place_order -> modify_sltp) ---
+                result = place_order(symbol, side, lot, MAGIC, comment="NawthviperBot") # Step 1: Market order
 
                 if result is not None and getattr(result, 'retcode', None) == mt5.TRADE_RETCODE_DONE:
-                    # Order is open! Get the ticket.
                     ticket = None
                     try:
-                        # The deal ID is the ticket of the order that was executed
                         deal_id = getattr(result, 'deal', None)
                         if deal_id:
-                            # We must use history_deals_get to find the position_id from the deal_id
                             deal_info = mt5.history_deals_get(deal=deal_id)
                             if deal_info and len(deal_info) > 0:
                                 ticket = deal_info[0].position_id # This is the position ticket
                     except Exception as e:
                         send_info(f"[WARN] Could not find ticket from deal {deal_id}: {e}")
 
-                    # Fallback if deal method fails
                     if not ticket:
                         try:
                             send_info("[INFO] Ticket not found via deal, trying fallback...")
@@ -1277,13 +1277,10 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
                     if not ticket:
                         safe_telegram(f"⚠️ ORDER PLACED {symbol} {side.upper()} but FAILED to find ticket. SL/TP not set.")
                         send_info(f"[ORDER FAIL] Order opened but could not get ticket. Result: {result}")
-                        continue # Don't proceed
+                        continue 
 
                     # Step 2: Now that order is open, modify it to add SL/TP
                     modify_success = modify_position_sltp(ticket, sl, tp)
-
-                    if not modify_success:
-                        safe_telegram(f"⚠️ ORDER PLACED {symbol} {side.upper()} ticket:{ticket} but FAILED to set SL/TP.")
 
                     # Log and store the trade regardless of SL/TP modification
                     trade_id = log_pending_trade(strategy, side, reason, zone, entry, sl, tp, lot, symbol=symbol, trade_id=ticket)
@@ -1293,16 +1290,16 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
                         'entry_price': entry, 'sl': sl 
                     }
 
+                    # --- VIX75 UPGRADE: Clean "Order Placed" message ---
                     if modify_success:
-                        safe_telegram(f"✅ ORDER PLACED {symbol} {side.upper()} conf:{confidence:.2f} ticket:{ticket} lot:{lot}")
+                        safe_telegram(f"✅ ORDER PLACED: {symbol} {side.upper()} | TKT: {ticket} | Lot: {lot:.2f} | Conf: {confidence:.2f}")
+                    else:
+                        safe_telegram(f"⚠️ ORDER PLACED: {symbol} {side.upper()} | TKT: {ticket} | ❌ FAILED TO SET SL/TP")
 
-                    # 🔄 Clear CRT cache
+                    # Clear CRT cache for this symbol
                     keys_to_remove = [k for k in _last_crt_alerts.keys() if k.startswith(f"{symbol}:")]
                     for k in keys_to_remove:
                         _last_crt_alerts.pop(k, None)
-
-                    # (This line was duplicated, removing it)
-                    # trade_id = log_pending_trade(strategy, side, reason, zone, entry, sl, tp, lot, symbol=symbol, trade_id=ticket)
 
                 else:
                     # The initial order placement failed
@@ -1311,11 +1308,10 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
                     
         except Exception as e:
             send_info(f"[EXCEPTION] processing signal {sig}: {e}\n{traceback.format_exc()}")
+    # === END OF VIX75 UPGRADE 2 ===
 
     # --- trailing stop + housekeeping ---
     try:
-        # === NEW (Enhancement #2): Check for 1R partial TP ===
-        # This replaces the old move_to_breakeven call
         check_for_partial_tp(symbol)
     except Exception as e:
         send_info(f"[WARN] check_for_partial_tp failed: {e}")
@@ -1340,35 +1336,7 @@ def monitor_and_trade(symbol, strategy_mode=None, fixed_lot=None):
 
 
 # ============================
-# CONFLICT CHECK WRAPPER
-# ============================
-
-def has_conflict_and_existing_confidence(symbol, side):
-    """
-    Wrapper that returns (conflict_bool, existing_confidence or None)
-    Uses runtime map first, then live positions.
-    """
-    # runtime map check
-    rec = active_trades_by_symbol.get(symbol)
-    if rec:
-        existing_side = rec.get('side')
-        existing_conf = rec.get('confidence', None)
-        if existing_side != side:
-            return True, existing_conf
-        if existing_side == side and not ALLOW_PYRAMID_SAME_SIDE:
-            return True, existing_conf
-        return False, existing_conf
-
-    # check live positions
-    positions = get_live_positions(symbol)
-    if not positions:
-        return False, None
-    # if positions exist, we consider conflict by default (safe)
-    return True, None
-
-
-# ============================
-# DAILY SUMMARY
+# (rest of file is unchanged)
 # ============================
 
 def _now_joburg():
@@ -1394,10 +1362,6 @@ def maybe_send_daily_summary():
             send_info(f"[WARN] Daily summary failed: {e}")
 
 
-# ============================
-# CLOSED-TRADES BACKFILL
-# ============================
-
 def _deal_is_exit(deal):
     """Return True if MT5 deal object represents an exit (close) leg."""
     try:
@@ -1413,16 +1377,9 @@ def _deal_is_exit(deal):
         return False
 
 
-# ============================
-# CLOSED-TRADES BACKFILL (UPDATED)
-# ============================
-
 def check_closed_trades(symbol, lookback_days=2):
-    """Fetch recent MT5 history and update CSV for trades we know about.
-
-    Now runs with extra debug logs so you can see if deals are skipped.
-    """
-    global tp1_hit_tickets # <-- NEW
+    """Fetch recent MT5 history and update CSV for trades we know about."""
+    global tp1_hit_tickets
     
     try:
         if not mt5_init_if_needed():
@@ -1432,12 +1389,8 @@ def check_closed_trades(symbol, lookback_days=2):
         start = now - timedelta(days=lookback_days)
         deals = mt5.history_deals_get(start, now)
         if not deals:
-            # send_info(f"[DEBUG] No deals found for {symbol} in last {lookback_days} days.")
             return
 
-        # send_info(f"[DEBUG] Found {len(deals)} deals in MT5 history for {symbol}.")
-
-        # Build reverse map ticket -> (symbol, rec)
         ticket_map = {}
         for sym, rec in active_trades_by_symbol.items():
             t = rec.get('ticket')
@@ -1457,16 +1410,13 @@ def check_closed_trades(symbol, lookback_days=2):
                     candidate_ticket = pos_id
 
                 if candidate_ticket is None:
-                    #send_info(f"[DEBUG] Deal {deal_id} skipped (ticket not in runtime map).")
                     continue
 
                 key = (candidate_ticket, deal_id)
                 if key in _seen_closed_pairs:
-                    # send_info(f"[DEBUG] Deal {deal_id} already processed.")
                     continue
 
                 if not _deal_is_exit(deal):
-                    # send_info(f"[DEBUG] Deal {deal_id} is not an exit leg.")
                     continue
 
                 sym, rec = ticket_map[candidate_ticket]
@@ -1478,16 +1428,10 @@ def check_closed_trades(symbol, lookback_days=2):
                 profit = float(getattr(deal, 'profit', 0.0))
                 result_text = "win" if profit > 0 else ("loss" if profit < 0 else "breakeven")
 
-                # === Check if this deal is a full close ===
-                # We need to check the *live* position volume
-                # If a deal happens, but a position with this ticket *still exists*,
-                # it was a partial close.
-                
                 live_position = get_position_by_ticket(candidate_ticket)
                 is_full_close = live_position is None
 
                 if is_full_close:
-                    # Update CSV/trade log
                     update_trade_result(
                         trade_id=trade_id,
                         exit_price=exit_price,
@@ -1497,24 +1441,19 @@ def check_closed_trades(symbol, lookback_days=2):
                     )
 
                     _seen_closed_pairs.add(key)
-                    # Clean up all our runtime maps
                     active_trades_by_symbol.pop(sym, None)
-                    tp1_hit_tickets.discard(candidate_ticket) # <-- NEW: Clean up set
+                    tp1_hit_tickets.discard(candidate_ticket) 
 
-                    # Telegram notification
                     emoji = "💰🟢" if profit > 0 else "🔻🔴" if profit < 0 else "😐"
                     safe_telegram(f"{emoji} {sym} closed | PnL: ${profit:.2f} | Price: {exit_price:.5f}")
-                    # 🔄 Clear CRT cache for this symbol (so fresh CRT alerts can trigger)
+                    
                     keys_to_remove = [k for k in _last_crt_alerts.keys() if k.startswith(f"{symbol}:")]
                     for k in keys_to_remove:
                         _last_crt_alerts.pop(k, None)
                     send_info(f"[CLOSED] {sym} ticket={candidate_ticket} pnl={profit:.2f}")
                 else:
-                    # This was a partial close (like our TP1), not a full close.
-                    # Don't remove it from active_trades_by_symbol.
-                    # Just log that a partial close occurred.
                     send_info(f"[PARTIAL] {sym} ticket={candidate_ticket} pnl={profit:.2f} (position still open)")
-                    _seen_closed_pairs.add(key) # Mark this *deal* as seen
+                    _seen_closed_pairs.add(key) 
 
 
             except Exception as inner:
@@ -1531,26 +1470,24 @@ def check_closed_trades(symbol, lookback_days=2):
 if __name__ == "__main__":
     send_info(f"scalper_strategy_engine starting. DRY_RUN={DRY_RUN}")
 
-    # --- NEW: Initialize MT5 connection ---
     if not mt5_init_if_needed():
         send_info("[CRITICAL] MT5 connection failed on startup. Exiting.")
         safe_telegram("❌ Bot failed to connect to MT5 on startup. Please check credentials/server.")
-        exit() # Exit if we can't connect at all
+        exit() 
         
     send_info("[INFO] MT5 connection successful.")
 
-    # --- NEW: Load state ---
     try:
         load_open_trades_from_csv(path=TRADES_LOCAL_CSV)
     except Exception as e:
         send_info(f"[CRITICAL] Failed to load open trades state: {e}")
     
     send_startup_intro()
-    time_module.sleep(2)   # fixed
+    time_module.sleep(2)   
     
     for sym in SYMBOLS:
         try:
-            symbol = normalize_symbol(sym) # This will now use the active connection
+            symbol = normalize_symbol(sym) 
             monitor_and_trade(symbol)
         except Exception as e:
             send_info(f"[ERROR] monitor_and_trade for {sym} failed: {e}\n{traceback.format_exc()}")

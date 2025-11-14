@@ -13,6 +13,9 @@ def macd_cross(macd_line, signal_line):
 
 def rsi_filter(rsi_values, side):
     """
+    VIX75 UPGRADE: This filter now checks for MOMENTUM, not reversal.
+    This aligns with the new H4 trend-following bias.
+    
     Returns True if RSI confirms the trade direction (momentum).
     For buy: RSI > 50 (bullish momentum).
     For sell: RSI < 50 (bearish momentum).
@@ -23,10 +26,10 @@ def rsi_filter(rsi_values, side):
     last_rsi = rsi_values[-1]
 
     if side == "buy":
-        # Price is in a bullish regime
+        # Price is in a bullish momentum regime
         return last_rsi > 50
     else: # sell
-        # Price is in a bearish regime
+        # Price is in a bearish momentum regime
         return last_rsi < 50
 
 def vwap_filter(price, vwap_value, side):

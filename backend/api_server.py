@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import MetaTrader5 as mt5
 import threading
+import traceback # <-- ADD THIS IMPORT AT THE TOP OF THE FILE
 import time
 from datetime import datetime
 # This assumes backtester.py exists. If not, this line can be commented out if not used.
@@ -10,35 +11,54 @@ from datetime import datetime
 # --- Global State ---
 bot_thread = None
 bot_running = False
+bot_stopper = None # <-- ADD THIS
 
 # Initialize Flask App
 app = Flask(__name__)
 CORS(app) 
 
 # --- Helper Functions ---
-def run_main_bot_logic(strategy, lot_size, max_daily_loss, max_drawdown):
+def run_main_bot_logic(strategy, lot_size, max_daily_loss, max_drawdown, stopper):
     """
     Runs the bot's main loop in a background thread.
-    NOTE: This requires a 'main.py' file with a 'run_bot_realtime' function.
+    (UPDATED with full error logging)
     """
     global bot_running
     try:
-        from main import run_bot_realtime
-        print(f"Bot thread started with strategy: {strategy}, lot: {lot_size}, max_loss: {max_daily_loss}, max_dd: {max_drawdown}")
+        # This import will now work because your main.py file exists
+        print("[BOT THREAD] Attempting to import 'run_bot_realtime' from 'main'...")
+        from main import run_bot_realtime 
+        print("[BOT THREAD] Import successful. Starting bot logic...")
+        
+        # Pass all args AND the stopper object to the bot loop
         run_bot_realtime(
             strategy_mode=strategy,
             fixed_lot=lot_size,
             daily_loss_limit=max_daily_loss,
-            drawdown_limit=max_drawdown
+            drawdown_limit=max_drawdown,
+            stopper=stopper
         )
-    except ImportError:
-        print("ERROR: Could not import 'run_bot_realtime' from 'main'. Bot cannot start.")
-        # Simulate bot running for a few seconds for demo purposes if main.py is missing
-        time.sleep(10)
+        
+    except ImportError as e:
+        # --- THIS IS THE NEW, DETAILED ERROR BLOCK ---
+        print("\n" + "="*50)
+        print("--- CRITICAL IMPORT ERROR ---")
+        print(f"ERROR: Could not import 'run_bot_realtime' from 'main'.")
+        print(f"This *usually* means 'main.py' (or a file it imports, like 'scalper_strategy_engine.py')")
+        print(f"is missing one of *its* dependencies.")
+        print("\n--- ROOT CAUSE (Full Traceback) ---")
+        print(traceback.format_exc())
+        print("="*50 + "\n")
+        # --- END OF NEW BLOCK ---
+        
     except Exception as e:
+        print(f"\n--- UNEXPECTED BOT THREAD ERROR ---")
         print(f"An error occurred in the bot thread: {e}")
+        print(traceback.format_exc())
+        print("="*50 + "\n")
+        
     finally:
-        bot_running = False
+        bot_running = False # Bot loop finished, update API state
         print("Bot thread has finished.")
 
 # --- API Endpoints ---
@@ -78,7 +98,7 @@ def login():
 
 @app.route('/start-bot', methods=['POST'])
 def start_bot():
-    global bot_thread, bot_running
+    global bot_thread, bot_running, bot_stopper # <-- ADD 'bot_stopper'
     if bot_running:
         return jsonify({"status": "error", "message": "Bot is already running."}), 400
 
@@ -91,7 +111,11 @@ def start_bot():
     print(f"Received request to start bot with strategy: {strategy}, lot: {lot_size}, max loss: {max_daily_loss}, max DD: {max_drawdown}")
     
     bot_running = True
-    bot_thread = threading.Thread(target=run_main_bot_logic, args=(strategy, lot_size, max_daily_loss, max_drawdown))
+    # Create a mutable 'stopper' object (a dictionary)
+    bot_stopper = {"stop": False} 
+    
+    # Pass the stopper object to the bot thread
+    bot_thread = threading.Thread(target=run_main_bot_logic, args=(strategy, lot_size, max_daily_loss, max_drawdown, bot_stopper))
     bot_thread.start()
     
     return jsonify({"status": "success", "message": f"Bot started with {strategy} strategy."})
@@ -99,12 +123,17 @@ def start_bot():
 
 @app.route('/stop-bot', methods=['POST'])
 def stop_bot():
-    global bot_running
+    global bot_running, bot_stopper # <-- ADD 'bot_stopper'
     if not bot_running:
         return jsonify({"status": "error", "message": "Bot is not running."}), 400
     
     print("Received request to stop bot.")
-    bot_running = False 
+    
+    # Set the flag inside the mutable 'stopper' object
+    # The bot thread will see this change and stop itself
+    if bot_stopper:
+        bot_stopper["stop"] = True 
+    
     return jsonify({"status": "success", "message": "Bot stop signal sent."})
 
 

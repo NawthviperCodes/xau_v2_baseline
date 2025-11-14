@@ -77,7 +77,7 @@ def close_partial_and_move_sl_to_be(ticket, partial_close_percent=0.5):
         "magic": position.magic,
         "comment": "Partial TP1",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": mt5.ORDER_FILLING_FOK,
     }
 
     try:
@@ -154,7 +154,7 @@ def place_order(symbol, side, lot, magic, comment="", sl=None, tp=None):
             "magic": magic,
             "comment": comment,
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
         }
 
         # Attach SL/TP if valid

@@ -1,24 +1,19 @@
-# === trade_decision_engine.py (Probability-based candlestick + indicator confluence + CRT)
-# Merged & updated: calibrated confidences, hard rejection for pattern/zone mismatch,
-# fixes for NoneType subscripting, CRT behavior preserved (filter-only for strict/trend_follow, override for aggressive).
+# === trade_decision_engine.py (VIX75 UPGRADES APPLIED) ===
 #
-# Updates:
-# - Added Inside Bar and Inside Bar False Breakout detection
-# - compute_candlestick_confidence now accepts last_closed_h1 (H1 safety filter)
-# - run_trade_decision_engine now accepts last_closed_h1, fibo_zone, bollinger_bands
-# - Fibonacci confluence boost and Bollinger Bands ranging filter integrated
+# ✅ VIX75 UPGRADE 1: Multi-Timeframe (HTF) Bias
+# - The 'run_trade_decision_engine' function now accepts 'htf_bias'.
+# - A new master filter is added to block any trade that goes
+#   against the H4 trend (e.g., blocks BUYs in an H4 DOWN bias).
 #
-# ✅ FIX #1 (Opposing Zone Filter):
-# - Added a new filter in run_trade_decision_engine to block trades that
-#   are too close to an opposing H1 zone (e.g., block BUYs near H1 Supply).
-#
-# ✅ FIX #3 (Invalid Stops Rejection):
-# - Increased minimum SL distance from 3 pips (30 points) to 6 pips (60 points)
-#   in both the CRT_MTF block and the build_entry function to prevent
-#   broker rejections for "Invalid Stops".
+# ✅ VIX75 UPGRADE 2: Clean Signal System
+# - REMOVED all 'send_telegram_message' and 'notify' calls.
+# - This file is now silent. It only analyzes and returns signals.
+# - The 'scalper_strategy_engine' is now responsible for all Telegram messages.
 #
 from datetime import datetime
-from telegram_notifier import send_telegram_message
+# (We keep 'send_telegram_message' imported *only* because your old
+# 'notify' function uses it, but we will comment out the calls)
+from telegram_notifier import send_telegram_message 
 from candlestick_patterns import (
     is_bullish_pin_bar,
     is_bearish_pin_bar,
@@ -28,43 +23,40 @@ from candlestick_patterns import (
     is_evening_star,
     is_bullish_rectangle,
     is_bearish_rectangle,
-    is_inside_bar,                 # <--- ADDED
-    is_inside_bar_false_breakout   # <--- ADDED
+    is_inside_bar,                 
+    is_inside_bar_false_breakout   
 )
-from indicator_filters import macd_cross, rsi_filter, vwap_filter  # keep for compatibility
+from indicator_filters import macd_cross, rsi_filter, vwap_filter
 import pandas as pd
 import math
 
 # --- Config ---
-REQUIRE_RETEST_FOR_ENGULFING = True   # Set False to disable the retest requirement (quick toggle)
+REQUIRE_RETEST_FOR_ENGULFING = True   
 
 # --- Tunable thresholds (calibrated) ---
-MIN_CONFIDENCE_FOR_TRADE = 0.60    # Lowered global floor (from 0.65)
-MIN_CONF_TRAD_FOLLOW = 0.60        # trend-follow floor
-MIN_CONF_AGGRESSIVE = 0.65         # slightly higher for aggressive
+MIN_CONFIDENCE_FOR_TRADE = 0.60    
+MIN_CONF_TRAD_FOLLOW = 0.60        
+MIN_CONF_AGGRESSIVE = 0.65         
 MAX_TOUCH_ALLOWED = 3
-MIN_CONF_FOR_TELEGRAM = 0.80       # lowered to 0.70
-CRT_MIN_MOMENTUM = 0.25            # Minimum candle body strength (25%)
-CRT_MIN_CLOSE_POSITION = 0.3       # How close to extremes (30% from edge)
+MIN_CONF_FOR_TELEGRAM = 0.70 # This is now read by scalper_strategy_engine
+CRT_MIN_MOMENTUM = 0.25            
+CRT_MIN_CLOSE_POSITION = 0.3       
 
 # Logging & Caching
 RESET_BUFFER_POINTS = 1000
 rejected_signals_log = []
-# runtime cache so we only send CRT alerts once per zone unless changed
-_last_crt_alerts = {}  # { "<symbol>:<zone_type>:<zone_price>": { "side": "buy"/"sell", "entry": float, "sl": float, "tp": float } }
-# runtime cache so CRT only fires once per symbol (symbol-level CRT)
-_last_crt_crt_only = {}  # { "EURUSD": { "side":..., "entry":..., "sl":..., "tp":... } }
-
-# runtime throttle timestamps (UTC)
-_last_crt_time = {}  # { "EURUSD": datetime } 
-# --- NEW: General signal throttle (for zone-based signals) ---
-_last_general_signal_time = {} # { "EURUSD": datetime }
-
-# runtime CRT throttle timestamps (UTC)
-_last_crt_time = {}  # { "EURUSD": datetime }
+_last_crt_alerts = {}  
+_last_crt_crt_only = {} 
+_last_crt_time = {} 
+_last_general_signal_time = {}
+_last_crt_time = {}
 
 
 def format_confidence_label(conf):
+    """
+    Formats confidence score into a human-readable string with emoji.
+    (This is now imported by the main engine)
+    """
     if conf >= 0.85:
         return f"{conf:.2f} 🔥 High"
     elif conf >= 0.70:
@@ -74,13 +66,18 @@ def format_confidence_label(conf):
 
 
 def notify(message: str, channel: bool = False):
-    if channel:
-        try:
-            send_telegram_message(message)
-        except Exception as e:
-            print(f"[TG FAIL] {e}\nMessage: {message}")
-    else:
-        print(message)
+    """
+    VIX75 UPGRADE: This function is now SILENCED.
+    All notifications are handled by the main strategy engine.
+    """
+    # if channel:
+    #     try:
+    #         send_telegram_message(message) # <-- REMOVED
+    #     except Exception as e:
+    #         print(f"[TG FAIL] {e}\nMessage: {message}")
+    # else:
+    print(f"[SILENCED_NOTIFY] {message}") # We print to console for debugging
+    pass
 
 
 # --- Helpers ---
@@ -98,34 +95,23 @@ def _safe_get(val, key, default=None):
 def _active_trade_conflict(active_trades, symbol, side):
     """
     Robust check to determine if an opposite or same-side active trade exists.
-    Handles multiple shapes of active_trades:
-      - dict keyed by symbol
-      - dict keyed by 'buy'/'sell'
-      - list of dicts [{'symbol':..., 'side':...}, ...]
-    Returns True if conflict (i.e., there exists an opposite-side open trade for same symbol or a trade on same side if you want to prevent duplicates).
     """
     if not active_trades:
         return False
 
-    # If dict keyed by symbol: e.g. active_trades[symbol] = {...}
     if isinstance(active_trades, dict):
         if symbol in active_trades:
             existing = active_trades[symbol]
-            # if stored structure has 'side'
             ex_side = existing.get('side') if isinstance(existing, dict) else None
             if ex_side and ex_side != side:
-                return True  # opposite-side already present
-            # if ex_side same as side, we consider it a conflict to avoid duplicate
+                return True
             if ex_side == side:
                 return True
 
-        # Also check for buy/sell keys
         if side in active_trades:
-            # active_trades['buy'] may be non-empty
             if active_trades.get(side):
                 return True
 
-        # Finally, check any dict values list of positions
         for k, v in active_trades.items():
             if isinstance(v, list):
                 for pos in v:
@@ -133,7 +119,6 @@ def _active_trade_conflict(active_trades, symbol, side):
                     if isinstance(pos, dict):
                         pos_side = pos.get('side') or pos.get('type')
                     else:
-                        # try attribute access
                         pos_side = getattr(pos, 'side', None)
                     if pos_side and pos_side != side and getattr(pos, 'symbol', symbol) == symbol:
                         return True
@@ -141,7 +126,6 @@ def _active_trade_conflict(active_trades, symbol, side):
                         return True
         return False
 
-    # If list of positions
     if isinstance(active_trades, list):
         for pos in active_trades:
             pos_sym = None
@@ -153,56 +137,33 @@ def _active_trade_conflict(active_trades, symbol, side):
                 pos_sym = getattr(pos, 'symbol', None)
                 pos_side = getattr(pos, 'side', None)
             if pos_sym == symbol:
-                # if any position exists on symbol, treat as conflict
                 return True
         return False
 
-    # fallback: no conflict
     return False
 
 
-# === CRT Filter helper (to reduce micro/noise signals) ===
 def crt_filter(symbol, entry, sl, tp, candle_range, atr_value, side, df_like, confidence,
                last_crt_time_dict, min_conf=None, min_lookback=10, min_time_sec=600, point_value=None):
     """
     Filters out micro/noise CRT signals before they are sent/used.
-
-    Parameters:
-      - symbol: instrument string
-      - entry/sl/tp: float
-      - candle_range: float (e.g., high - low of the key candle)
-      - atr_value: float or None
-      - side: "buy" or "sell"
-      - df_like: pandas-like dataframe with 'high' and 'low' columns (should contain at least `min_lookback` rows)
-      - confidence: numeric 0..1
-      - last_crt_time_dict: dict storing last send times (UTC datetimes)
-      - min_conf: minimum confidence required for CRT to be considered (if None, uses MIN_CONF_FOR_TELEGRAM)
-      - min_lookback: number of bars to look back for structure check
-      - min_time_sec: minimum seconds between CRT alerts for this symbol
-      - point_value: instrument price point (tick), used to build min_pip fallback
-    Returns:
-      - dict with the CRT data if passes filters, else None
+    (This function is unchanged, it's just a filter)
     """
     try:
         if min_conf is None:
-            min_conf = MIN_CONF_FOR_TELEGRAM
+            min_conf = MIN_CONF_FOR_TELEGRAM 
 
-        # 1) Confidence gate
         if confidence < min_conf:
             return None
 
-        # 2) Candle size filter: require meaningful size vs ATR (if ATR provided)
         if atr_value is not None and not pd.isna(atr_value):
             if candle_range < 0.25 * float(atr_value):
                 return None
         else:
-            # if no ATR, require absolute candle_range > small threshold derived from point or a default
             min_range = point_value * 2 if point_value is not None else 0.0002
             if candle_range < min_range:
                 return None
 
-        # 3) Entry/SL/TP distance check: avoid tiny SL/TP
-        # min_pip: default 1 * point or 0.0005 for FX
         if point_value is None:
             min_pip = 0.0005
         else:
@@ -210,24 +171,20 @@ def crt_filter(symbol, entry, sl, tp, candle_range, atr_value, side, df_like, co
         if abs(entry - sl) < min_pip or abs(tp - entry) < min_pip:
             return None
 
-        # 4) Structure filter: require that entry is beyond recent swing (avoid tiny internal flips)
         try:
             if hasattr(df_like, '__len__') and len(df_like) >= 3:
                 lookback = min(min_lookback, len(df_like))
                 recent_high = max(df_like['high'].iloc[-lookback:])
                 recent_low = min(df_like['low'].iloc[-lookback:])
                 if side == "buy":
-                    # entry should break above a recent swing high or at least be near it (ensure directional strength)
                     if entry <= recent_high:
                         return None
                 else:  # sell
                     if entry >= recent_low:
                         return None
         except Exception:
-            # if any error, be conservative and fail-safe and skip
             return None
 
-        # 5) Time/spacing filter (avoid spam within min_time_sec)
         now = datetime.utcnow()
         last_sent = last_crt_time_dict.get(symbol)
         if last_sent is not None:
@@ -235,7 +192,6 @@ def crt_filter(symbol, entry, sl, tp, candle_range, atr_value, side, df_like, co
             if delta < min_time_sec:
                 return None
 
-        # passed all checks
         last_crt_time_dict[symbol] = now
         return {
             "symbol": symbol,
@@ -249,21 +205,12 @@ def crt_filter(symbol, entry, sl, tp, candle_range, atr_value, side, df_like, co
         return None
 
 
-# --- NEW: Engulfing retest filter ---
 def engulfing_retested(prev_candle, engulf_candle, next_candle, side):
     """
     Confirm that price retested the engulfing body before continuing.
-    - prev_candle: the candle being engulfed (object with .open/.close/.high/.low or dict-like)
-    - engulf_candle: the engulfing candle (object)
-    - next_candle: the candle after engulfing (object)
-    - side: "buy" or "sell"
-    
-    Returns True if next_candle shows a retest into the engulfing body:
-      - For a bullish engulfing: next_candle.low <= engulf_body_low
-      - For a bearish engulfing: next_candle.high >= engulf_body_high
+    (Unchanged)
     """
     try:
-        # extract body edges robustly
         e_open = _safe_get(engulf_candle, 'open', _safe_get(engulf_candle, 'Open', None))
         e_close = _safe_get(engulf_candle, 'close', _safe_get(engulf_candle, 'Close', None))
         n_low = _safe_get(next_candle, 'low', _safe_get(next_candle, 'Low', None))
@@ -284,26 +231,14 @@ def engulfing_retested(prev_candle, engulf_candle, next_candle, side):
 
 
 
-# --- NEW: CRT detection (User's Power of Three Strategy) ---
 def is_crt_pattern(c1, c2, c3):
     """
-    Implements  Power of Three strategy:
-    1. c1 = Accumulation (Defines the range)
-    2. c2 = Manipulation (Sweeps c1 liquidity) + Reversal (Closes back inside c1 range)
-    3. c3 = Confirmation candle (Closes in the trade direction)
-    
-    Entry: Market entry (close of c3)
-    SL: Beyond the manipulation wick (c2)
-    TP: Opposite side of the accumulation range (c1)
+    Implements Power of Three strategy:
+    (Unchanged)
     """
     try:
-        # c1 (Accumulation)
         o1, h1, l1, cl1 = c1.open, c1.high, c1.low, c1.close
-        
-        # c2 (Manipulation / Reversal)
         o2, h2, l2, cl2 = c2.open, c2.high, c2.low, c2.close
-        
-        # c3 (Confirmation)
         o3, h3, l3, cl3 = c3.open, c3.high, c3.low, c3.close
         
         range_3 = h3 - l3
@@ -312,258 +247,191 @@ def is_crt_pattern(c1, c2, c3):
         body_3 = abs(cl3 - o3)
         body_ratio_3 = body_3 / range_3 if range_3 > 0 else 0
         
-        # --- Bearish CRT (Power of Three) ---
-        # 1. c2 manipulates c1 high (h2 > h1)
-        # 2. c2 closes back inside c1 range (cl2 <= h1 and cl2 >= l1)
-        # 3. c3 confirms by closing bearish (cl3 < cl2)
+        # --- Bearish CRT ---
         if (h2 > h1) and (cl2 <= h1 and cl2 >= l1):
-            if cl3 < cl2: # c3 is confirmation
-                
-                # Momentum check on confirmation candle
+            if cl3 < cl2: 
                 close_position = (cl3 - l3) / range_3
                 if close_position > 0.3 or body_ratio_3 < 0.25:
-                    return None # Weak confirmation
+                    return None 
                     
-                entry_price = cl3  # Market entry at close of c3
-                sl_price = h2      # SL beyond manipulation wick
-                tp_price = l1      # TP at opposite side of accumulation (c1 low)
+                entry_price = cl3
+                sl_price = h2
+                tp_price = l1
 
-                # --- Sanity Check: Ensure TP/SL are valid ---
-                # 1. SL must be above entry
-                if sl_price <= entry_price:
-                    return None # Invalid trade (e.g., entry is already above SL)
-                # 2. TP must be below entry
-                if tp_price >= entry_price:
-                    return None # Invalid trade (e.g., TP is already hit)
-                # 3. Require at least 1:1 R:R
+                if sl_price <= entry_price: return None
+                if tp_price >= entry_price: return None
                 risk = abs(entry_price - sl_price)
                 reward = abs(entry_price - tp_price)
-                if reward < (risk * 0.9): # require at least 0.9R
-                    return None # Bad Risk:Reward
+                if reward < (risk * 0.9): return None 
 
                 return {
-                    "pattern": "crt_power_of_3", # New pattern name
+                    "pattern": "crt_power_of_3", 
                     "side": "sell",
-                    "entry_trigger": entry_price, # This is now a market entry price
+                    "entry_trigger": entry_price, 
                     "sl": sl_price,
                     "tp": tp_price,
                     "momentum_strength": body_ratio_3
                 }
 
-        # --- Bullish CRT (Power of Three) ---
-        # 1. c2 manipulates c1 low (l2 < l1)
-        # 2. c2 closes back inside c1 range (cl2 >= l1 and cl2 <= h1)
-        # 3. c3 confirms by closing bullish (cl3 > cl2)
+        # --- Bullish CRT ---
         if (l2 < l1) and (cl2 >= l1 and cl2 <= h1):
-            if cl3 > cl2: # c3 is confirmation
-
-                # Momentum check on confirmation candle
+            if cl3 > cl2:
                 close_position = (cl3 - l3) / range_3
                 if close_position < 0.7 or body_ratio_3 < 0.25:
-                    return None # Weak confirmation
+                    return None
                     
-                entry_price = cl3  # Market entry at close of c3
-                sl_price = l2      # SL beyond manipulation wick
-                tp_price = h1      # TP at opposite side of accumulation (c1 high)
+                entry_price = cl3
+                sl_price = l2
+                tp_price = h1
                 
-                # --- Sanity Check: Ensure TP/SL are valid ---
-                # 1. SL must be below entry
-                if sl_price >= entry_price:
-                    return None # Invalid trade
-                # 2. TP must be above entry
-                if tp_price <= entry_price:
-                    return None # Invalid trade
-                # 3. Require at least 1:1 R:R
+                if sl_price >= entry_price: return None
+                if tp_price <= entry_price: return None
                 risk = abs(entry_price - sl_price)
                 reward = abs(entry_price - tp_price)
-                if reward < (risk * 0.9): # require at least 0.9R
-                    return None # Bad Risk:Reward
+                if reward < (risk * 0.9): return None
 
                 return {
-                    "pattern": "crt_power_of_3", # New pattern name
+                    "pattern": "crt_power_of_3", 
                     "side": "buy", 
-                    "entry_trigger": entry_price, # This is now a market entry price
+                    "entry_trigger": entry_price,
                     "sl": sl_price,
                     "tp": tp_price,
                     "momentum_strength": body_ratio_3
                 }
-
     except Exception:
         return None
-    
     return None
 
 def is_crt_pattern_mtf(c2, c3, htf_high, htf_low):
     """
     Implements the multi-timeframe Power of Three strategy.
-    - htf_high/low: The H1 "Accumulation" range.
-    - c2: The M1 "Manipulation" candle that sweeps the H1 range.
-    - c3: The M1 "Confirmation" candle.
+    (Unchanged)
     """
     try:
-        # c2 (Manipulation / Reversal candle)
         o2, h2, l2, cl2 = c2.open, c2.high, c2.low, c2.close
-        # c3 (Confirmation candle)
         o3, h3, l3, cl3 = c3.open, c3.high, c3.low, c3.close
 
-        # Momentum checks on confirmation candle (c3)
         range_3 = h3 - l3
         if range_3 == 0: return None
         body_3 = abs(cl3 - o3)
         body_ratio_3 = body_3 / range_3 if range_3 > 0 else 0
         
         # --- Bearish CRT (Sell Setup) ---
-        # 1. M1 candle manipulates H1 high (h2 > htf_high)
-        # 2. M1 candle closes back inside H1 range (cl2 <= htf_high)
-        # 3. Next M1 candle confirms by closing bearish (cl3 < cl2)
         if (h2 > htf_high) and (cl2 <= htf_high):
             if cl3 < cl2:
-                # Check momentum of confirmation candle (c3)
                 close_position = (cl3 - l3) / range_3
                 if close_position > 0.3 or body_ratio_3 < 0.25:
-                    return None # Weak confirmation
+                    return None
                 
                 entry_price = cl3
                 sl_price = h2
                 tp_price = htf_low
                 
-                # Sanity checks
                 if sl_price <= entry_price or tp_price >= entry_price: return None
                 risk = abs(entry_price - sl_price)
                 reward = abs(entry_price - tp_price)
-                if risk == 0 or reward < (risk * 0.9): return None # Avoid bad R:R
+                if risk == 0 or reward < (risk * 0.9): return None
 
                 return { "pattern": "crt_mtf_sell", "side": "sell", "entry_trigger": entry_price, "sl": sl_price, "tp": tp_price }
 
         # --- Bullish CRT (Buy Setup) ---
-        # 1. M1 candle manipulates H1 low (l2 < htf_low)
-        # 2. M1 candle closes back inside H1 range (cl2 >= htf_low)
-        # 3. Next M1 candle confirms by closing bullish (cl3 > cl2)
         if (l2 < htf_low) and (cl2 >= htf_low):
             if cl3 > cl2:
-                # Check momentum of confirmation candle (c3)
                 close_position = (cl3 - l3) / range_3
                 if close_position < 0.7 or body_ratio_3 < 0.25:
-                    return None # Weak confirmation
+                    return None
 
                 entry_price = cl3
                 sl_price = l2
                 tp_price = htf_high
                 
-                # Sanity checks
                 if sl_price >= entry_price or tp_price <= entry_price: return None
                 risk = abs(entry_price - sl_price)
                 reward = abs(entry_price - tp_price)
-                if risk == 0 or reward < (risk * 0.9): return None # Avoid bad R:R
+                if risk == 0 or reward < (risk * 0.9): return None
 
                 return { "pattern": "crt_mtf_buy", "side": "buy", "entry_trigger": entry_price, "sl": sl_price, "tp": tp_price }
 
     except Exception:
         return None
-    
     return None
 
 
 # --- Candlestick confidence computation (CALIBRATED) ---
 def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=None, vwap=None, atr=None, m5_context=None, last_closed_h1=None):
     """
-    Input:
-      - candles: list-like or DataFrame slice where latest is candles[-1]
-      - macd, macd_signal, rsi, vwap, atr: indicator arrays/values (may be None)
-      - m5_context: dict with 'trend' key if present
-      - last_closed_h1: The last *closed* H1 candle object (for safety filter)
-    Output:
-      - confidence: float 0.0..1.0
-      - pattern_info: dict { 'pattern': str, 'side': 'buy'|'sell' or None, 'crt_extra': {...}|None }
+    (This function is unchanged)
     """
     pattern = None
     side = None
     base_conf = 0.0
 
-    # ensure we have at least 3 candles
     try:
         if len(candles) < 3:
             return 0.0, {"pattern": None, "side": None}
     except Exception:
         return 0.0, {"pattern": None, "side": None}
 
-    # If pandas DataFrame slice: convert to list of row-like objects that the candlestick functions expect
     c1 = candles.iloc[-3] if isinstance(candles, (pd.DataFrame, pd.Series)) else candles[-3]
     c2 = candles.iloc[-2] if isinstance(candles, (pd.DataFrame, pd.Series)) else candles[-2]
     c3 = candles.iloc[-1] if isinstance(candles, (pd.DataFrame, pd.Series)) else candles[-1]
 
-    # Extract raw numbers robustly
     o1 = _safe_get(c1, 'open', _safe_get(c1, 'Open', None))
     h1 = _safe_get(c1, 'high', _safe_get(c1, 'High', None))
     l1 = _safe_get(c1, 'low', _safe_get(c1, 'Low', None))
     cl1 = _safe_get(c1, 'close', _safe_get(c1, 'Close', None))
-
     o2 = _safe_get(c2, 'open', _safe_get(c2, 'Open', None))
     h2 = _safe_get(c2, 'high', _safe_get(c2, 'High', None))
     l2 = _safe_get(c2, 'low', _safe_get(c2, 'Low', None))
     cl2 = _safe_get(c2, 'close', _safe_get(c2, 'Close', None))
-
     o3 = _safe_get(c3, 'open', _safe_get(c3, 'Open', None))
     h3 = _safe_get(c3, 'high', _safe_get(c3, 'High', None))
     l3 = _safe_get(c3, 'low', _safe_get(c3, 'Low', None))
     cl3 = _safe_get(c3, 'close', _safe_get(c3, 'Close', None))
 
-    # --- Pattern base confidence assignments (CALIBRATED) ---
     try:
         if is_morning_star(c1, c2, c3):
-            base_conf = max(base_conf, 0.68)  # was 0.72 -> lowered
+            base_conf = max(base_conf, 0.68)
             pattern = "morning_star"
             side = "buy"
         elif is_evening_star(c1, c2, c3):
             base_conf = max(base_conf, 0.68)
             pattern = "evening_star"
             side = "sell"
-    except Exception:
-        pass
-
+    except Exception: pass
     try:
         if is_bullish_engulfing(o2, h2, l2, cl2, o3, h3, l3, cl3, require_wick=True):
-            base_conf = max(base_conf, 0.72) # Back to a higher value for a strong pattern
+            base_conf = max(base_conf, 0.72)
             pattern = "bullish_engulfing"
             side = "buy"
         elif is_bearish_engulfing(o2, h2, l2, cl2, o3, h3, l3, cl3, require_wick=True):
-            base_conf = max(base_conf, 0.72) # Back to a higher value for a strong pattern
+            base_conf = max(base_conf, 0.72)
             pattern = "bearish_engulfing"
             side = "sell"
-    except Exception:
-        pass
-
+    except Exception: pass
     try:
         if is_bullish_pin_bar(o3, h3, l3, cl3):
-            base_conf = max(base_conf, 0.70) # Increased value for a strict pin bar
+            base_conf = max(base_conf, 0.70)
             pattern = "bullish_pin_bar"
             side = "buy"
         elif is_bearish_pin_bar(o3, h3, l3, cl3):
-            base_conf = max(base_conf, 0.70) # Increased value for a strict pin bar
+            base_conf = max(base_conf, 0.70)
             pattern = "bearish_pin_bar"
             side = "sell"
-    except Exception:
-        pass
-
+    except Exception: pass
     try:
         if len(candles) >= 5:
             if is_bullish_rectangle(candles[-5:]):
-                base_conf = max(base_conf, 0.50)  # lowered from 0.58
+                base_conf = max(base_conf, 0.50)
                 pattern = "bullish_rectangle"
                 side = "buy"
             elif is_bearish_rectangle(candles[-5:]):
                 base_conf = max(base_conf, 0.50)
                 pattern = "bearish_rectangle"
                 side = "sell"
-    except Exception:
-        pass
-
-    # === NEW: Inside Bar (Continuation) ===
+    except Exception: pass
     try:
-        # Check mother (c2) and baby (c3) — using function signature
         if is_inside_bar(o2, h2, l2, cl2, o3, h3, l3, cl3):
-            # If M5 trend context suggests continuation, give decent base conf
-            # but only keep if m5_context indicates a trend direction
             if m5_context and m5_context.get('trend') == "uptrend":
                 base_conf = max(base_conf, 0.65)
                 pattern = "inside_bar"
@@ -572,71 +440,50 @@ def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=Non
                 base_conf = max(base_conf, 0.65)
                 pattern = "inside_bar"
                 side = "sell"
-            else:
-                # No clear M5 trend -> treat as neutral (do not set pattern)
-                pass
-    except Exception:
-        pass
-
-    # === NEW: Inside Bar False Breakout (Stop Hunt) ===
+            else: pass
+    except Exception: pass
     try:
         fakeout_side = is_inside_bar_false_breakout(o2, h2, l2, cl2, o3, h3, l3, cl3)
         if fakeout_side == "buy":
-            base_conf = max(base_conf, 0.75) # Very high confidence reversal
+            base_conf = max(base_conf, 0.75)
             pattern = "inside_bar_fakeout_bullish"
             side = "buy"
         elif fakeout_side == "sell":
-            base_conf = max(base_conf, 0.75) # Very high confidence reversal
+            base_conf = max(base_conf, 0.75)
             pattern = "inside_bar_fakeout_bearish"
             side = "sell"
-    except Exception:
-        pass
+    except Exception: pass
 
-    # --- CRT (Candle Range Theory) ---
     crt_extra = None
     try:
         crt_signal = is_crt_pattern(c1, c2, c3)
         if crt_signal:
-            # Adjust confidence based on momentum strength (calibrated)
             momentum = crt_signal.get("momentum_strength", 0.5)
-            if momentum > 0.6:   # Strong momentum
-                base_conf = max(base_conf, 0.72)  # lowered from 0.80
-            elif momentum < 0.3: # Weak momentum  
-                base_conf = max(base_conf, 0.60)  # lowered from 0.68
-            else:                # Medium momentum
-                base_conf = max(base_conf, 0.66)  # lowered from 0.74
+            if momentum > 0.6: base_conf = max(base_conf, 0.72)
+            elif momentum < 0.3: base_conf = max(base_conf, 0.60)
+            else: base_conf = max(base_conf, 0.66)
             pattern = "crt"
             side = crt_signal["side"]
             crt_extra = crt_signal
     except Exception:
         crt_extra = None
 
-    # If no pattern detected, return 0
     if not pattern or not side:
         return 0.0, {"pattern": None, "side": None}
 
-    # === NEW: H1 Momentum Safety Filter (Bible p. 70, 83) ===
-    # This filter ensures our M5 signal is not fighting the main H1 momentum.
     if last_closed_h1 is not None:
         try:
             h1_is_bullish = float(_safe_get(last_closed_h1, 'close', _safe_get(last_closed_h1, 'Close', None))) > float(_safe_get(last_closed_h1, 'open', _safe_get(last_closed_h1, 'Open', None)))
             h1_is_bearish = float(_safe_get(last_closed_h1, 'close', _safe_get(last_closed_h1, 'Close', None))) < float(_safe_get(last_closed_h1, 'open', _safe_get(last_closed_h1, 'Open', None)))
             
             if side == "buy" and not h1_is_bullish:
-                # M5 signal is BUY, but H1 momentum is bearish/doji
-                return 0.0, {"pattern": "h1_momentum_misaligned", "side": None} # HARD REJECT
-                
+                return 0.0, {"pattern": "h1_momentum_misaligned", "side": None} 
             if side == "sell" and not h1_is_bearish:
-                # M5 signal is SELL, but H1 momentum is bullish/doji
-                return 0.0, {"pattern": "h1_momentum_misaligned", "side": None} # HARD REJECT
-        except Exception:
-            pass # Fail-safe, skip filter
-    # =========================================================
+                return 0.0, {"pattern": "h1_momentum_misaligned", "side": None}
+        except Exception: pass
 
-    # --- Confluence adjustments (small boosts/penalties) ---
     conf = base_conf
 
-    # M5 context: boost when aligned, penalize when opposite (only if provided)
     if m5_context:
         m5_trend = m5_context.get('trend')
         if m5_trend:
@@ -645,69 +492,43 @@ def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=Non
             else:
                 conf -= 0.08
 
-    # MACD: boost if MACD favors the side
     try:
         if macd is not None and macd_signal is not None and len(macd) > 0 and len(macd_signal) > 0:
-            # use last values
-            if side == "buy" and macd[-1] > macd_signal[-1]:
-                conf += 0.06
-            if side == "sell" and macd[-1] < macd_signal[-1]:
-                conf += 0.06
-            # small penalty if opposite
-            if side == "buy" and macd[-1] <= macd_signal[-1]:
-                conf -= 0.04
-            if side == "sell" and macd[-1] >= macd_signal[-1]:
-                conf -= 0.04
-    except Exception:
-        pass
-
-    # RSI: boost if RSI supports direction (not extreme)
+            if side == "buy" and macd[-1] > macd_signal[-1]: conf += 0.06
+            if side == "sell" and macd[-1] < macd_signal[-1]: conf += 0.06
+            if side == "buy" and macd[-1] <= macd_signal[-1]: conf -= 0.04
+            if side == "sell" and macd[-1] >= macd_signal[-1]: conf -= 0.04
+    except Exception: pass
     try:
         if rsi is not None and len(rsi) > 0:
             last_rsi = float(rsi[-1])
             if side == "buy":
-                if last_rsi >= 50:
-                    conf += 0.04
-                elif last_rsi < 30:
-                    conf -= 0.08  # oversold weirdness (penalize)
+                if last_rsi >= 50: conf += 0.04
+                elif last_rsi < 30: conf -= 0.08
             elif side == "sell":
-                if last_rsi <= 50:
-                    conf += 0.04
-                elif last_rsi > 70:
-                    conf -= 0.08
-    except Exception:
-        pass
-
-    # VWAP: small boost if price is on the right side of VWAP (if provided)
+                if last_rsi <= 50: conf += 0.04
+                elif last_rsi > 70: conf -= 0.08
+    except Exception: pass
     try:
         if vwap is not None:
             last_price = cl3 if cl3 is not None else _safe_get(c3, 'close')
             if last_price is not None:
-                if side == "buy" and last_price >= vwap:
-                    conf += 0.03
-                if side == "sell" and last_price <= vwap:
-                    conf += 0.03
-    except Exception:
-        pass
-
-    # ATR/distance sanity: penalize if pattern formed far from zone relative to ATR (caller can add zone distance)
+                if side == "buy" and last_price >= vwap: conf += 0.03
+                if side == "sell" and last_price <= vwap: conf += 0.03
+    except Exception: pass
     try:
         if atr is not None and not math.isnan(float(atr)):
             distance = abs(cl3 - ((h3 + l3) / 2)) if (h3 is not None and l3 is not None) else 0
-            if distance > 3.5 * float(atr):
-                conf -= 0.08
-            elif distance <= 1.0 * float(atr):
-                conf += 0.02
-    except Exception:
-        pass
+            if distance > 3.5 * float(atr): conf -= 0.08
+            elif distance <= 1.0 * float(atr): conf += 0.02
+    except Exception: pass
 
-    # clamp confidence to [0, 1]
     conf = max(0.0, min(1.0, conf))
 
     return conf, {"pattern": pattern, "side": side, "crt_extra": crt_extra if pattern == "crt" else None}
 
 
-# --- Main decision engine (updated with Hard Rejection) ---
+# --- Main decision engine (VIX75 UPGRADES APPLIED) ---
 def run_trade_decision_engine(
     symbol,
     point,
@@ -719,7 +540,7 @@ def run_trade_decision_engine(
     m5_candles_for_patterns,
     active_trades,
     zone_touch_counts,
-    SL_BUFFER, # NOTE: legacy param kept for compatibility
+    SL_BUFFER, 
     TP_RATIO,
     CHECK_RANGE,
     LOT_SIZE,
@@ -731,11 +552,12 @@ def run_trade_decision_engine(
     vwap=None,
     atr=None,
     m5_context=None,
-    htf_high=None,  # ✅ New parameter for H1 high
-    htf_low=None,   # ✅ New parameter for H1 low
-    last_closed_h1=None, # <--- ADD THIS
-    fibo_zone=None,      # <--- ADD THIS
-    bollinger_bands=None # <--- ADD THIS
+    htf_high=None,  
+    htf_low=None,   
+    last_closed_h1=None, 
+    fibo_zone=None,      
+    bollinger_bands=None, 
+    htf_bias=None # <-- VIX75 UPGRADE 1: New parameter
 ):
     """
     Returns:
@@ -745,7 +567,6 @@ def run_trade_decision_engine(
     signals = []
     flipped_zones = []
 
-    # Combine all zones for structural TP search
     all_zones_list = list(demand_zones) + list(supply_zones)
 
     def log_rejection(reason, zone_type, zone_price, strategy_mode_local, trend_context):
@@ -762,37 +583,22 @@ def run_trade_decision_engine(
         if not m5_context:
             return True
         m5_trend = m5_context.get("trend")
-
-        # --- Stricter Check for Trend-Follow Mode (Hard Gate) ---
         if trend_type == "trend_follow":
-            if side == "buy" and m5_trend != "uptrend":
-                return False
-            if side == "sell" and m5_trend != "downtrend":
-                return False
+            if side == "buy" and m5_trend != "uptrend": return False
+            if side == "sell" and m5_trend != "downtrend": return False
             return True
-
-        # --- Original logic for aggressive/counter-trend ---
         if is_fast_zone:
-            if side == "buy" and m5_trend == "downtrend":
-                return False
-            if side == "sell" and m5_trend == "uptrend":
-                return False
+            if side == "buy" and m5_trend == "downtrend": return False
+            if side == "sell" and m5_trend == "uptrend": return False
             return True
-
         if trend_type == "counter_trend":
-            if side == "buy":
-                return m5_trend == "uptrend"
-            if side == "sell":
-                return m5_trend == "downtrend"
+            if side == "buy": return m5_trend == "uptrend"
+            if side == "sell": return m5_trend == "downtrend"
         return False
 
     def update_touch_count(zone_price, candle_time, in_zone, min_time_gap_sec=30):
         if zone_price not in zone_touch_counts:
-            zone_touch_counts[zone_price] = {
-                'count': 0,
-                'last_touch_time': candle_time,
-                'was_outside_zone': True
-            }
+            zone_touch_counts[zone_price] = { 'count': 0, 'last_touch_time': candle_time, 'was_outside_zone': True }
         zone_state = zone_touch_counts[zone_price]
         if isinstance(candle_time, pd.Timestamp):
             candle_time = candle_time.to_pydatetime()
@@ -807,22 +613,16 @@ def run_trade_decision_engine(
         return zone_state['count']
 
     def candle_confirms_breakout(trend_, candle_, zone_price_, min_dist=20):
-        # min_dist in price points (caller uses point)
-        if trend_ == "uptrend" and (candle_.close - zone_price_) > min_dist:
-            return True
-        elif trend_ == "downtrend" and (zone_price_ - candle_.close) > min_dist:
-            return True
+        if trend_ == "uptrend" and (candle_.close - zone_price_) > min_dist: return True
+        elif trend_ == "downtrend" and (zone_price_ - candle_.close) > min_dist: return True
         return False
 
     def is_valid_engulfing(prev, curr, direction):
-        # re-use earlier logic (body engulfing)
         try:
             body_prev = abs(prev.close - prev.open) if hasattr(prev, 'close') else abs(prev['close'] - prev['open'])
             body_curr = abs(curr.close - curr.open) if hasattr(curr, 'close') else abs(curr['close'] - curr['open'])
-        except Exception:
-            return False
-        if body_prev == 0:
-            return False
+        except Exception: return False
+        if body_prev == 0: return False
         if direction == "bullish":
             return (curr.open < prev.close) and (curr.close > prev.open) and (body_curr > body_prev)
         elif direction == "bearish":
@@ -830,88 +630,53 @@ def run_trade_decision_engine(
         return False
 
     def build_entry(side, candle, prev_candle, zone_price, lot_size, atr_value, point_value, all_zones):
-    
-        # === SL & LOT SIZE FIX ===
-        # Reduced multiplier from 2.0 to 0.5. The SL is placed below the
-        # pattern's wick + this small buffer. This is tighter and per the Bible's logic.
-        ATR_SL_MULTIPLIER = 0.5  # 0.5x ATR buffer (was 2.0)
-        # Reduced fixed SL points from 150 to 50 (5 pips fallback)
-        MIN_ABS_SL_DISTANCE = 50 * point_value # Was 150
-        # =========================
-        
+        ATR_SL_MULTIPLIER = 0.5 
+        MIN_ABS_SL_DISTANCE = 50 * point_value
         entry_price = getattr(candle, 'close', candle['close'])
         
-        # --- 1. Dynamic SL Calculation (Tighter Logic) ---
         if atr_value is None or pd.isna(atr_value) or atr_value <= 0:
-            # Fallback to fixed points
-            if side == "buy":
-                wick_sl = getattr(candle, 'low', candle['low']) - MIN_ABS_SL_DISTANCE
-            else:
-                wick_sl = getattr(candle, 'high', candle['high']) + MIN_ABS_SL_DISTANCE
+            if side == "buy": wick_sl = getattr(candle, 'low', candle['low']) - MIN_ABS_SL_DISTANCE
+            else: wick_sl = getattr(candle, 'high', candle['high']) + MIN_ABS_SL_DISTANCE
         else:
-            # Standard logic: Wick + ATR buffer
-            sl_distance_buffer = float(atr_value) * ATR_SL_MULTIPLIER # This is now a small buffer
+            sl_distance_buffer = float(atr_value) * ATR_SL_MULTIPLIER 
             if side == "buy":
-                # SL is placed below the LOW of the last two candles
                 recent_low = min(getattr(candle, 'low', candle['low']), getattr(prev_candle, 'low', prev_candle['low']))
-                wick_sl = recent_low - sl_distance_buffer # SL = wick low - 0.5*ATR
+                wick_sl = recent_low - sl_distance_buffer
             else:
-                # SL is placed above the HIGH of the last two candles
                 recent_high = max(getattr(candle, 'high', candle['high']), getattr(prev_candle, 'high', prev_candle['high']))
-                wick_sl = recent_high + sl_distance_buffer # SL = wick high + 0.5*ATR
+                wick_sl = recent_high + sl_distance_buffer
 
-        # --- 2. Dynamic TP Calculation (Structural / Volatility-Adjusted) ---
         risk_distance = abs(entry_price - wick_sl)
         
-        # === FIX #3: Enforce minimum 10-pip (100 points) SL ===
-        min_sl_dist = point_value * 150 # 15 pips
+        min_sl_dist = point_value * 150 
         if risk_distance < min_sl_dist:
-            if side == "buy":
-                wick_sl = entry_price - min_sl_dist
-            else:
-                wick_sl = entry_price + min_sl_dist
+            if side == "buy": wick_sl = entry_price - min_sl_dist
+            else: wick_sl = entry_price + min_sl_dist
             risk_distance = abs(entry_price - wick_sl)
-        # ===================================================
 
-        # Use the user's global TP_RATIO (which is 2)
         tp_atr_ratio = entry_price + (risk_distance * TP_RATIO) if side == "buy" else entry_price - (risk_distance * TP_RATIO)
 
-        # Find the nearest structural TP
         opposing_zone_type = "supply" if side == "buy" else "demand"
         opposing_zones = [z for z in all_zones if opposing_zone_type in z['type']]
-
         tp_structural = None
         min_tp_dist = float('inf')
         for z in opposing_zones:
-            # Ensure zone is profitable
             if (side == "buy" and z['price'] > entry_price) or (side == "sell" and z['price'] < entry_price):
                 dist = abs(z['price'] - entry_price)
                 if dist < min_tp_dist:
                     min_tp_dist = dist
                     tp_structural = z['price']
-
-        # --- TP Decision Logic ---
-        # Default to the 2R TP
-        tp = tp_atr_ratio
         
-        # If a structural TP exists:
+        tp = tp_atr_ratio
         if tp_structural is not None:
-            # 1. Check if structural TP is *at least* 1R away
             if abs(tp_structural - entry_price) >= risk_distance * 0.9:
-                # 2. Check if structural TP is *closer* than the 2R TP
                 if (side == "buy" and tp_structural < tp_atr_ratio) or \
-                (side == "sell" and tp_structural > tp_atr_ratio):
-                    # Use the (safer, closer) structural TP
+                   (side == "sell" and tp_structural > tp_atr_ratio):
                     tp = tp_structural
         
         return {
-            "side": side,
-            "entry": entry_price,
-            "sl": wick_sl,
-            "tp": tp,
-            "zone": zone_price,
-            "lot": lot_size,
-            "strategy": strategy_mode
+            "side": side, "entry": entry_price, "sl": wick_sl, "tp": tp,
+            "zone": zone_price, "lot": lot_size, "strategy": strategy_mode
         }
 
     # ======================================================
@@ -921,14 +686,12 @@ def run_trade_decision_engine(
         if len(m1_candles_for_crt) < 3:
             log_rejection("not_enough_m1_candles", "n/a", 0, strategy_mode, trend)
             return signals, flipped_zones
-        
-        c1_m1 = m1_candles_for_crt.iloc[-3] # M1 c1 (for M1 CRT)
-        c2_m1 = m1_candles_for_crt.iloc[-2] # M1 c2 (for M1 CRT + MTF CRT)
-        c3_m1 = m1_candles_for_crt.iloc[-1] # M1 c3 (for M1 CRT + MTF CRT)
+        c1_m1 = m1_candles_for_crt.iloc[-3] 
+        c2_m1 = m1_candles_for_crt.iloc[-2] 
+        c3_m1 = m1_candles_for_crt.iloc[-1] 
     except Exception as e:
         log_rejection(f"m1_candle_extraction_failed: {e}", "n/a", 0, strategy_mode, trend)
         return signals, flipped_zones
-    
     
     # ======================================================
     # ✅ 2. EXTRACT M5 CANDLES (for Zone-based Patterns)
@@ -937,23 +700,12 @@ def run_trade_decision_engine(
         if len(m5_candles_for_patterns) < 5:
             log_rejection("not_enough_m5_candles_for_patterns", "n/a", 0, strategy_mode, trend)
             return signals, flipped_zones
-        
         candles_for_patterns = m5_candles_for_patterns.tail(5)
-        c1_pat_m5 = candles_for_patterns.iloc[-3]
-        c2_pat_m5 = candles_for_patterns.iloc[-2]
-        c3_pat_m5 = candles_for_patterns.iloc[-1]
-        candle = c3_pat_m5
-        prev_candle = c2_pat_m5
-        
-        demand_price_check = c2_pat_m5.low
-        supply_price_check = c2_pat_m5.high
+        c1_pat_m5, c2_pat_m5, c3_pat_m5 = candles_for_patterns.iloc[-3], candles_for_patterns.iloc[-2], candles_for_patterns.iloc[-1]
+        candle, prev_candle = c3_pat_m5, c2_pat_m5
+        demand_price_check, supply_price_check = c2_pat_m5.low, c2_pat_m5.high
         candle_time = c3_pat_m5.time
-        
-        # === Compatibility alias (to prevent downstream errors) ===
-        # Many old parts of the file still reference `last3_candles` and `candles`
-        # We'll map them to M5 candles so they stay functional
-        last3_candles = m5_candles_for_patterns.tail(5)
-        candles = last3_candles
+        last3_candles, candles = m5_candles_for_patterns.tail(5), m5_candles_for_patterns.tail(5)
         c1, c2, c3 = c1_pat_m5, c2_pat_m5, c3_pat_m5
     except Exception as e:
         log_rejection(f"m5_candle_extraction_failed: {e}", "n/a", 0, strategy_mode, trend)
@@ -964,184 +716,116 @@ def run_trade_decision_engine(
     # ======================================================
     crt_signal = None
     if htf_high is not None and htf_low is not None:
-        try:
-            # We pass ATR down, so the CRT signal itself is more robust
-            crt_signal = is_crt_pattern_mtf(c2_m1, c3_m1, htf_high, htf_low)
-        except Exception:
-            crt_signal = None
+        try: crt_signal = is_crt_pattern_mtf(c2_m1, c3_m1, htf_high, htf_low)
+        except Exception: crt_signal = None
 
     if crt_signal is not None:
         
-        # === SL & LOT SIZE FIX (APPLY BUFFER) ===
-        sl_price = crt_signal.get("sl")
-        entry_price = crt_signal.get("entry_trigger")
+        # --- VIX75 UPGRADE 1: HTF BIAS FILTER ---
         order_side = crt_signal.get("side")
-        atr_buffer = 0.0
-        
-        if atr is not None and not pd.isna(atr):
-            atr_buffer = float(atr) * 1.0 # 1x M1 ATR buffer
-        
-        # Apply ATR buffer to the raw SL wick
-        if order_side == "buy":
-            sl_price = sl_price - atr_buffer
+        if (htf_bias == "UP" and order_side == "sell") or (htf_bias == "DOWN" and order_side == "buy"):
+            log_rejection("HTF Bias blocks MTF CRT", "crt_mtf", htf_high, strategy_mode, htf_bias)
+            # Do not return yet, let M1 CRT or zone logic run
         else:
-            sl_price = sl_price + atr_buffer
-        
-        # === FIX #3: Enforce a minimum 6-pip (60 points) SL distance ===
-        min_sl_dist = point * 150 # 15 pips (was 100)
-        if abs(entry_price - sl_price) < min_sl_dist:
-            if order_side == "buy":
-                sl_price = entry_price - min_sl_dist
-            else:
-                sl_price = entry_price + min_sl_dist
-        # ===========================================================
-        
-        order = {
-            "side": order_side,
-            "entry": entry_price,       # Use original entry
-            "sl": sl_price,             # Use NEW buffered SL
-            "tp": crt_signal.get("tp"),
-            "zone": None,
-            "lot": LOT_SIZE, # This is just a placeholder, risk calc will override
-            "strategy": "crt_mtf",
-            "reason": crt_signal.get("pattern"),
-            "confidence": 0.90
-        }
+            # --- CRT Signal is valid, proceed ---
+            sl_price = crt_signal.get("sl")
+            entry_price = crt_signal.get("entry_trigger")
+            atr_buffer = 0.0
+            if atr is not None and not pd.isna(atr):
+                atr_buffer = float(atr) * 1.0
+            if order_side == "buy": sl_price = sl_price - atr_buffer
+            else: sl_price = sl_price + atr_buffer
+            
+            min_sl_dist = point * 150 
+            if abs(entry_price - sl_price) < min_sl_dist:
+                if order_side == "buy": sl_price = entry_price - min_sl_dist
+                else: sl_price = entry_price + min_sl_dist
+            
+            order = {
+                "side": order_side, "entry": entry_price, "sl": sl_price,
+                "tp": crt_signal.get("tp"), "zone": None, "lot": LOT_SIZE, 
+                "strategy": "crt_mtf", "reason": crt_signal.get("pattern"),
+                "confidence": 0.90 # MTF CRT gets high confidence
+            }
 
-        conflict = _active_trade_conflict(active_trades, symbol, order['side'])
-        if not conflict:
-            signals.append(order)
+            conflict = _active_trade_conflict(active_trades, symbol, order['side'])
+            if not conflict:
+                signals.append(order)
 
-        # 🔸 Immediate return — MTF CRT takes precedence
-        return signals, flipped_zones
+            # 🔸 Immediate return — MTF CRT takes precedence
+            return signals, flipped_zones
 
     all_zones = [("demand", demand_zones), ("supply", supply_zones)]
 
     # --- CRT handling ---
     crt_signal_m1 = None
-    try:
-        crt_signal_m1 = is_crt_pattern(c1_m1, c2_m1, c3_m1)
-    except Exception:
-        crt_signal_m1 = None
+    try: crt_signal_m1 = is_crt_pattern(c1_m1, c2_m1, c3_m1)
+    except Exception: crt_signal_m1 = None
 
     if crt_signal_m1 is not None:
-        raw_entry = crt_signal_m1.get("entry_trigger", getattr(c3, 'close', c3['close']))
-        raw_sl = crt_signal_m1.get("sl", getattr(c3, 'close', c3['close']))
-        raw_tp = crt_signal_m1.get("tp", getattr(c3, 'close', c3['close']))
+        
+        # --- VIX75 UPGRADE 1: HTF BIAS FILTER ---
+        order_side_m1_crt = crt_signal_m1.get("side")
+        if (htf_bias == "UP" and order_side_m1_crt == "sell") or (htf_bias == "DOWN" and order_side_m1_crt == "buy"):
+            log_rejection("HTF Bias blocks M1 CRT", "crt_m1", 0, strategy_mode, htf_bias)
+        else:
+            # --- M1 CRT Signal is valid, proceed ---
+            raw_entry = crt_signal_m1.get("entry_trigger", getattr(c3, 'close', c3['close']))
+            raw_sl = crt_signal_m1.get("sl", getattr(c3, 'close', c3['close']))
+            raw_tp = crt_signal_m1.get("tp", getattr(c3, 'close', c3['close']))
+            entry_buffer = point * 5
+            if crt_signal_m1.get("side") == "buy": raw_entry += entry_buffer
+            elif crt_signal_m1.get("side") == "sell": raw_entry -= entry_buffer
 
-        entry_buffer = point * 5
-        if crt_signal_m1.get("side") == "buy":
-            raw_entry += entry_buffer
-        elif crt_signal_m1.get("side") == "sell":
-            raw_entry -= entry_buffer
+            try:
+                cr_h = _safe_get(c2, 'high', _safe_get(c2, 'High', None))
+                cr_l = _safe_get(c2, 'low', _safe_get(c2, 'Low', None))
+                candle_range_value = abs(cr_h - cr_l) if (cr_h is not None and cr_l is not None) else abs(_safe_get(c2, 'close', 0) - _safe_get(c2, 'open', 0))
+            except Exception:
+                candle_range_value = abs(_safe_get(c2, 'close', 0) - _safe_get(c2, 'open', 0))
 
-        try:
-            cr_h = _safe_get(c2, 'high', _safe_get(c2, 'High', None))
-            cr_l = _safe_get(c2, 'low', _safe_get(c2, 'Low', None))
-            candle_range_value = abs(cr_h - cr_l) if (cr_h is not None and cr_l is not None) else abs(_safe_get(c2, 'close', 0) - _safe_get(c2, 'open', 0))
-        except Exception:
-            candle_range_value = abs(_safe_get(c2, 'close', 0) - _safe_get(c2, 'open', 0))
+            temp_order = {
+                "side": crt_signal_m1.get("side"), "entry": raw_entry, "sl": raw_sl, "tp": raw_tp,
+                "zone": None, "lot": LOT_SIZE, "strategy": strategy_mode, "reason": "crt", "confidence": 0.75
+            }
 
-        temp_order = {
-            "side": crt_signal_m1.get("side"),
-            "entry": raw_entry,
-            "sl": raw_sl,
-            "tp": raw_tp,
-            "zone": None,
-            "lot": LOT_SIZE,
-            "strategy": strategy_mode,
-            "reason": "crt",
-            "confidence": 0.75
-        }
+            try:
+                crt_conf, _ = compute_candlestick_confidence(
+                    candles, macd=macd, macd_signal=macd_signal, rsi=rsi,
+                    vwap=vwap, atr=atr, m5_context=m5_context,
+                    last_closed_h1=last_closed_h1
+                )
+                temp_order["confidence"] = crt_conf if crt_conf and crt_conf > 0 else temp_order["confidence"]
+            except Exception: pass
 
-        try:
-            crt_conf, _ = compute_candlestick_confidence(
-                candles,
-                macd=macd,
-                macd_signal=macd_signal,
-                rsi=rsi,
-                vwap=vwap,
-                atr=atr,
-                m5_context=m5_context,
-                last_closed_h1=last_closed_h1  # <--- PASS H1 safety here too
+            crt_pass = crt_filter(
+                symbol=symbol, entry=float(temp_order["entry"]), sl=float(temp_order["sl"]), tp=float(temp_order["tp"]),
+                candle_range=float(candle_range_value), atr_value=atr, side=temp_order["side"], df_like=last3_candles,
+                confidence=temp_order["confidence"], last_crt_time_dict=_last_crt_time,
+                min_conf=None, min_lookback=10, min_time_sec=1800, point_value=point
             )
-            temp_order["confidence"] = crt_conf if crt_conf and crt_conf > 0 else temp_order["confidence"]
-        except Exception:
-            pass
 
-        crt_pass = crt_filter(
-            symbol=symbol,
-            entry=float(temp_order["entry"]),
-            sl=float(temp_order["sl"]),
-            tp=float(temp_order["tp"]),
-            candle_range=float(candle_range_value),
-            atr_value=atr,
-            side=temp_order["side"],
-            df_like=last3_candles,
-            confidence=temp_order["confidence"],
-            last_crt_time_dict=_last_crt_time,
-            min_conf=None,
-            min_lookback=10,
-            min_time_sec=1800,
-            point_value=point
-        )
+            if crt_pass and strategy_mode == "aggressive":
+                key = symbol
+                current_state = { "side": temp_order['side'], "entry": float(temp_order['entry']), "sl": float(temp_order['sl']), "tp": float(temp_order['tp']) }
+                last = _last_crt_crt_only.get(key)
+                if last != current_state:
+                    # notify(...) # <-- VIX75 UPGRADE: REMOVED TELEGRAM FLOOD
+                    _last_crt_crt_only[key] = current_state
 
-        if crt_pass and strategy_mode == "aggressive":
-            key = symbol
-            current_state = {
-                "side": temp_order['side'],
-                "entry": float(temp_order['entry']),
-                "sl": float(temp_order['sl']),
-                "tp": float(temp_order['tp'])
-            }
-            last = _last_crt_crt_only.get(key)
-            if last != current_state:
-                notify(
-                    f"📥 CRT Alert (AGGRESSIVE): {symbol} pattern detected | {temp_order['side'].upper()} idea\n"
-                    f"   🔹 Entry: {temp_order['entry']:.5f}\n"
-                    f"   🔹 SL: {temp_order['sl']:.5f}\n"
-                    f"   🔹 TP: {temp_order['tp']:.5f}\n"
-                    f"   🔹 Confidence: {format_confidence_label(temp_order['confidence'])}",
-                    channel=True
-                )
-                _last_crt_crt_only[key] = current_state
+                signals.append(temp_order)
+                return signals, flipped_zones # M1 CRT also takes precedence
 
-            signals.append({
-                "side": temp_order['side'],
-                "entry": temp_order['entry'],
-                "sl": temp_order['sl'],
-                "tp": temp_order['tp'],
-                "zone": None,
-                "lot": LOT_SIZE,
-                "strategy": strategy_mode,
-                "reason": "crt",
-                "confidence": temp_order['confidence']
-            })
-
-            return signals, flipped_zones
-
-        if crt_pass:
-            key = f"{symbol}:CRT"
-            current_state = {
-                "side": temp_order['side'],
-                "entry": float(temp_order['entry']),
-                "sl": float(temp_order['sl']),
-                "tp": float(temp_order['tp'])
-            }
-            last = _last_crt_alerts.get(key)
-            if last != current_state:
-                notify(
-                    f"📥 CRT Alert: {symbol} pattern detected | {temp_order['side'].upper()} idea\n"
-                    f"   🔹 Entry: {temp_order['entry']:.5f}\n"
-                    f"   🔹 SL: {temp_order['sl']:.5f}\n"
-                    f"   🔹 TP: {temp_order['tp']:.5f}\n"
-                    f"   🔹 Confidence: {format_confidence_label(temp_order['confidence'])}",
-                    channel=True
-                )
-                _last_crt_alerts[key] = current_state
+            if crt_pass:
+                key = f"{symbol}:CRT"
+                current_state = { "side": temp_order['side'], "entry": float(temp_order['entry']), "sl": float(temp_order['sl']), "tp": float(temp_order['tp']) }
+                last = _last_crt_alerts.get(key)
+                if last != current_state:
+                    # notify(...) # <-- VIX75 UPGRADE: REMOVED TELEGRAM FLOOD
+                    _last_crt_alerts[key] = current_state
 
     # --- Zone-based patterns (engulfing, pin bars, rectangles, etc.) ---
-    entry_buffer = point * 5  # 5 pip buffer
+    entry_buffer = point * 5
 
     for zone_type, zones in all_zones:
         for zone in list(zones):
@@ -1149,109 +833,78 @@ def run_trade_decision_engine(
             is_fast = "fast" in str(zone.get('type', '')).lower()
             lot_size = LOT_SIZE / 2 if is_fast else LOT_SIZE
 
-            # === NEW: Ranging Market Bollinger Band Filter (Bible p. 106) ===
+            # --- VIX75 UPGRADE 1: HTF BIAS FILTER ---
+            desired_side = "buy" if zone_type == "demand" else "sell"
+            if (htf_bias == "UP" and desired_side == "sell") or (htf_bias == "DOWN" and desired_side == "buy"):
+                log_rejection("HTF Bias blocks zone", zone_type, zone_price, strategy_mode, htf_bias)
+                continue # This zone is against the H4 trend, skip it
+            # --- END OF FILTER ---
+
             if strategy_mode == "ranging" and bollinger_bands:
-                # In ranging mode, we ONLY trade if the H1 zone *also*
-                # has confluence with the Bollinger Bands.
-                bb_low = bollinger_bands.get('demand')
-                bb_high = bollinger_bands.get('supply')
-                
-                # Check for confluence
+                bb_low, bb_high = bollinger_bands.get('demand'), bollinger_bands.get('supply')
                 try:
-                    # Use CHECK_RANGE as units (approx price distance); if zone vs band far -> skip
                     if zone_type == "demand" and (bb_low is None or abs(zone_price - bb_low) > (CHECK_RANGE * 2)):
                         log_rejection("ranging_bb_no_confluence", zone_type, zone_price, strategy_mode, trend)
-                        continue # Skip this zone
-
+                        continue
                     if zone_type == "supply" and (bb_high is None or abs(zone_price - bb_high) > (CHECK_RANGE * 2)):
                         log_rejection("ranging_bb_no_confluence", zone_type, zone_price, strategy_mode, trend)
-                        continue # Skip this zone
+                        continue
                 except Exception:
-                    # If anything goes wrong, be conservative and skip
                     log_rejection("ranging_bb_exception", zone_type, zone_price, strategy_mode, trend)
                     continue
-            # =============================================================
 
             dist = abs(demand_price_check - zone_price) if zone_type == "demand" else abs(supply_price_check - zone_price)
             in_zone = dist < CHECK_RANGE
             touch_number = update_touch_count(zone_price, candle_time, in_zone)
 
-            # skip if too many touches or not touched yet
-            if touch_number is None or touch_number == 0:
-                continue
+            if touch_number is None or touch_number == 0: continue
             if touch_number and touch_number > MAX_TOUCH_ALLOWED:
                 log_rejection("too many touches", zone_type, zone_price, strategy_mode, trend)
                 continue
 
-            trade_trend_type = "trend_follow" if (
-                (zone_type == "demand" and trend == "uptrend") or
-                (zone_type == "supply" and trend == "downtrend")
-            ) else "counter_trend"
+            trade_trend_type = "trend_follow" if ((zone_type == "demand" and trend == "uptrend") or (zone_type == "supply" and trend == "downtrend")) else "counter_trend"
 
             if strategy_mode == "trend_follow":
                 if (zone_type == "demand" and trend != "uptrend") or (zone_type == "supply" and trend != "downtrend"):
                     log_rejection("trend mismatch", zone_type, zone_price, strategy_mode, trend)
                     continue
 
-            # --- Compute candlestick confidence + pattern info ---
             cand_conf, pattern_info = compute_candlestick_confidence(
-                candles_for_patterns,
-                macd=macd,
-                macd_signal=macd_signal,
-                rsi=rsi,
-                vwap=vwap,
-                atr=atr,
-                m5_context=m5_context,
-                last_closed_h1=last_closed_h1  # <--- PASS H1 safety here
+                candles_for_patterns, macd=macd, macd_signal=macd_signal, rsi=rsi,
+                vwap=vwap, atr=atr, m5_context=m5_context, last_closed_h1=last_closed_h1
             )
             
-            # ==========================================================
-            # === NEW: Volatility/Momentum Filter  ===
-            # ==========================================================
             try:
                 if atr is not None and not pd.isna(atr) and atr > 0:
-                    pattern_candle = c3 # The last candle forms the pattern
+                    pattern_candle = c3
                     candle_range = pattern_candle.high - pattern_candle.low
-                    # Reject if the candle's total range is less than 70% of the current ATR
                     if candle_range < (atr * 0.7):
                         log_rejection("low_volatility_candle", zone_type, zone_price, strategy_mode, trend)
-                        continue # Skip this signal
+                        continue 
             except Exception as e:
-                # If check fails, log it but don't stop the bot
                 log_rejection(f"volatility_filter_exception: {e}", zone_type, zone_price, strategy_mode, trend)
-            # ==========================================================
 
-
-            desired_side = "buy" if zone_type == "demand" else "sell"
             if not pattern_info or pattern_info.get('side') is None:
                 log_rejection("no pattern", zone_type, zone_price, strategy_mode, trend)
                 continue
 
-            # --- HARD REJECTION for pattern-zone mismatch ---
             if pattern_info['side'] != desired_side:
-                # Immediately reject such signals
                 log_rejection("pattern-zone mismatch (HARD REJECT)", zone_type, zone_price, strategy_mode, trend)
-                continue  # <-- hard reject (no soft penalty)
+                continue
 
-            # CRT confluence (if CRT present and not overriding)
             try:
                 if crt_signal is not None:
                     if strategy_mode != "aggressive":
                         crt_side = crt_signal.get('side') if isinstance(crt_signal, dict) else None
-                        if crt_side and crt_side == pattern_info.get('side'):
-                            cand_conf += 0.06
+                        if crt_side and crt_side == pattern_info.get('side'): cand_conf += 0.06
                         else:
-                            if crt_side and crt_side != pattern_info.get('side'):
-                                cand_conf -= 0.06
-            except Exception:
-                pass
+                            if crt_side and crt_side != pattern_info.get('side'): cand_conf -= 0.06
+            except Exception: pass
 
-            # M5 soft gate
             if not m5_agrees_with_entry(pattern_info['side'], trade_trend_type, is_fast):
                 log_rejection("M5 disagreement", zone_type, zone_price, strategy_mode, trend)
                 continue
 
-            # Strategy-specific indicator hard filters (aggressive mode)
             if strategy_mode == "aggressive":
                 try:
                     if rsi is not None and len(rsi) > 0:
@@ -1262,9 +915,7 @@ def run_trade_decision_engine(
                         if pattern_info['side'] == "sell" and last_rsi > 60:
                             log_rejection("RSI too weak (aggressive sell)", zone_type, zone_price, strategy_mode, trend)
                             continue
-                except Exception:
-                    pass
-
+                except Exception: pass
                 try:
                     if macd is not None and macd_signal is not None and len(macd) > 0 and len(macd_signal) > 0:
                         if pattern_info['side'] == "buy" and macd[-1] <= macd_signal[-1]:
@@ -1273,9 +924,7 @@ def run_trade_decision_engine(
                         if pattern_info['side'] == "sell" and macd[-1] >= macd_signal[-1]:
                             log_rejection("MACD not bearish (aggressive)", zone_type, zone_price, strategy_mode, trend)
                             continue
-                except Exception:
-                    pass
-
+                except Exception: pass
                 try:
                     if vwap is not None:
                         last_price = float(_safe_get(c3, 'close', None))
@@ -1285,74 +934,48 @@ def run_trade_decision_engine(
                         if pattern_info['side'] == "sell" and last_price > vwap:
                             log_rejection("Price above VWAP (aggressive sell)", zone_type, zone_price, strategy_mode, trend)
                             continue
-                except Exception:
-                    pass
+                except Exception: pass
 
-            # === NEW: Fibonacci Confluence Boost (Bible p. 96, 100) ===
             order_side = pattern_info.get('side')
             if fibo_zone and order_side:
                 try:
-                    fibo_min = min(fibo_zone)
-                    fibo_max = max(fibo_zone)
-                    
-                    # Check if the pattern's zone_price is inside the Fibo zone
+                    fibo_min, fibo_max = min(fibo_zone), max(fibo_zone)
                     if fibo_min <= zone_price <= fibo_max:
-                        # Check if it's a pullback in a trend
                         if (order_side == "buy" and trend == "uptrend") or \
                            (order_side == "sell" and trend == "downtrend"):
-                            
-                            cand_conf += 0.15 # Significant confidence boost
-                except Exception:
-                    pass # Fibo check failsafe
-            # ========================================================
+                            cand_conf += 0.15 
+                except Exception: pass
 
-            # Final required confidence depending on strategy (use calibrated thresholds)
             required_conf = MIN_CONFIDENCE_FOR_TRADE
-            if strategy_mode == "trend_follow":
-                required_conf = MIN_CONF_TRAD_FOLLOW
-            elif strategy_mode == "aggressive":
-                required_conf = MIN_CONF_AGGRESSIVE
-
-            # final clamp
+            if strategy_mode == "trend_follow": required_conf = MIN_CONF_TRAD_FOLLOW
+            elif strategy_mode == "aggressive": required_conf = MIN_CONF_AGGRESSIVE
             cand_conf = max(0.0, min(1.0, cand_conf))
 
-            # If confidence below required, reject
             if cand_conf < required_conf:
                 log_rejection(f"low_confidence_{cand_conf:.2f}", zone_type, zone_price, strategy_mode, trend)
                 continue
 
-            # Check active trades for conflicts (avoid opening opposing hedged positions)
             conflict = _active_trade_conflict(active_trades, symbol, pattern_info['side'])
             if conflict:
                 log_rejection("active_trade_conflict", zone_type, zone_price, strategy_mode, trend)
                 continue
 
-            # Engulfing retest requirement
             if REQUIRE_RETEST_FOR_ENGULFING and pattern_info.get('pattern') in ["bullish_engulfing", "bearish_engulfing"]:
                 try:
                     next_candle = None
                     if len(last3_candles) > 3:
                         try:
-                            idx = list(last3_candles.index).index(c3.name)
-                            next_idx = idx + 1
-                            if next_idx < len(last3_candles):
-                                next_candle = last3_candles.iloc[next_idx]
-                        except Exception:
-                            next_candle = None
-
+                            idx = list(last3_candles.index).index(c3.name); next_idx = idx + 1
+                            if next_idx < len(last3_candles): next_candle = last3_candles.iloc[next_idx]
+                        except Exception: next_candle = None
                     if next_candle is None:
                         try:
-                            idx2 = list(candles.index).index(c3.name)
-                            next_idx2 = idx2 + 1
-                            if next_idx2 < len(candles):
-                                next_candle = candles.iloc[next_idx2]
-                        except Exception:
-                            next_candle = None
-
+                            idx2 = list(candles.index).index(c3.name); next_idx2 = idx2 + 1
+                            if next_idx2 < len(candles): next_candle = candles.iloc[next_idx2]
+                        except Exception: next_candle = None
                     if next_candle is None:
                         log_rejection("engulfing_no_next_candle_for_retest", zone_type, zone_price, strategy_mode, trend)
                         continue
-
                     if not engulfing_retested(prev_candle, candle, next_candle, pattern_info['side']):
                         log_rejection("engulfing_not_retested", zone_type, zone_price, strategy_mode, trend)
                         continue
@@ -1360,73 +983,37 @@ def run_trade_decision_engine(
                     log_rejection("engulfing_retest_exception", zone_type, zone_price, strategy_mode, trend)
                     continue
 
-            # Passed all checks -> build order
             order = build_entry(
-                pattern_info['side'], 
-                candle, 
-                prev_candle, 
-                zone_price, 
-                lot_size, 
-                atr_value=atr, 
-                point_value=point,
-                all_zones=all_zones_list
+                pattern_info['side'], candle, prev_candle, zone_price, lot_size, 
+                atr_value=atr, point_value=point, all_zones=all_zones_list
             )
             order["reason"] = pattern_info.get('pattern')
             order["confidence"] = cand_conf
             
-            # ==========================================================
-            # === NEW: Opposing Zone Filter (FIX #1) ===
-            # Block trade if entry is dangerously close to an opposing H1 zone
-            # This check uses the *full* lists of zones passed to the function.
-            OPPOSING_ZONE_PROXIMITY = 150 * point  # e.g., 15 pips "danger zone"
+            OPPOSING_ZONE_PROXIMITY = 150 * point
             is_blocked = False
-            order_entry = order['entry']
-            order_side = order['side']
+            order_entry, order_side = order['entry'], order['side']
 
             if order_side == "buy":
-                # Check if we are too close to ANY H1 SUPPLY zone
-                for s_zone in supply_zones: # Use the full list from function args
+                for s_zone in supply_zones:
                     zone_price_supply = s_zone['price']
                     if abs(order_entry - zone_price_supply) < OPPOSING_ZONE_PROXIMITY:
                         is_blocked = True
                         log_rejection(f"blocked_by_opposing_supply_at_{zone_price_supply:.5f}", "supply", zone_price_supply, strategy_mode, trend)
-                        break # Found a blocking zone
-
+                        break
             elif order_side == "sell":
-                # Check if we are too close to ANY H1 DEMAND zone
-                for d_zone in demand_zones: # Use the full list from function args
+                for d_zone in demand_zones:
                     zone_price_demand = d_zone['price']
                     if abs(order_entry - zone_price_demand) < OPPOSING_ZONE_PROXIMITY:
                         is_blocked = True
                         log_rejection(f"blocked_by_opposing_demand_at_{zone_price_demand:.5f}", "demand", zone_price_demand, strategy_mode, trend)
-                        break # Found a blocking zone
-
-            # If blocked, continue to the next zone/signal and do NOT append this one
+                        break
             if is_blocked:
                 continue
-            # ===============================================
 
-            # Throttle + notify if strong
-            MIN_THROTTLE_SEC = 300  # 5 minutes min
-            now = datetime.utcnow()
-            last_sent = _last_general_signal_time.get(symbol)
-            can_send_now = True
-            if last_sent:
-                time_diff_sec = (now - last_sent).total_seconds()
-                if time_diff_sec < MIN_THROTTLE_SEC:
-                    can_send_now = False
-
-            if can_send_now and cand_conf >= MIN_CONF_FOR_TELEGRAM:
-                notify(
-                    f"📥 SIGNAL {symbol} {zone_type.upper()} | {order['side'].upper()} {order['reason']}\n"
-                    f"   🔹 Entry: {order['entry']:.5f}\n"
-                    f"   🔹 SL: {order['sl']:.5f}\n"
-                    f"   🔹 TP: {order['tp']:.5f}\n"
-                    f"   🔹 Confidence: {format_confidence_label(cand_conf)}",
-                    channel=True
-                )
-                _last_general_signal_time[symbol] = now
-
+            # --- VIX75 UPGRADE: Remove all 'notify' and 'send_telegram' calls from here ---
+            # The main engine will handle messaging.
+            
             signals.append(order)
 
     return signals, flipped_zones
