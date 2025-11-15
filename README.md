@@ -145,15 +145,3 @@ NawthViperCodes – GitHub
 
 ---
 
-# ✅ Want me to generate a custom banner image for you?
-
-I can create:
-- 🔥 A dark professional trading-style banner  
-- 🐍 Python bot themed  
-- 📊 Candlestick/MT5 style  
-- 💎 With your bot name “NawthViper”  
-
-Just tell me your preferred **color theme** (Dark / Blue / Neon / Gold / etc).
-
-├── package.json
-└── README.md
