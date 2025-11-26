@@ -4,7 +4,7 @@ import MetaTrader5 as mt5
 import threading
 import traceback # <-- ADD THIS IMPORT AT THE TOP OF THE FILE
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 # This assumes backtester.py exists. If not, this line can be commented out if not used.
 # from backtester import run_backtest 
 
@@ -167,8 +167,9 @@ def get_account_history():
     if not mt5.terminal_info():
         return jsonify({"status": "error", "message": "MT5 connection not available."}), 500
 
-    deals = mt5.history_deals_get(0, datetime.now())
-    
+    from_date = datetime.now() - timedelta(hours=24)
+    deals = mt5.history_deals_get(from_date, datetime.now())
+        
     if deals is None or len(deals) == 0:
         # Return a clean empty state
         return jsonify({

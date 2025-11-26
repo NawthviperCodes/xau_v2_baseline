@@ -197,3 +197,63 @@ def is_bearish_rectangle(candles):
         return closes[-1] < min(closes[:-1])
     except Exception:
         return False
+
+# --- CRT (Candle Range Theory) / Power of 3 ---
+def is_crt_pattern(open_p, high, low, close_p, min_momentum=0.5, min_close_pos=0.3):
+    """
+    Detects a generic CRT expansion candle (large body, closing near high/low).
+    """
+    if None in [open_p, high, low, close_p]: return None
+    
+    range_len = high - low
+    if range_len == 0: return None
+    
+    body = abs(close_p - open_p)
+    
+    # 1. Momentum Check (Body is large relative to range)
+    if (body / range_len) < min_momentum: return None
+    
+    # 2. Bullish CRT
+    if close_p > open_p:
+        # Close must be in the top % of the wick
+        if (high - close_p) <= (range_len * min_close_pos):
+            return "buy"
+            
+    # 3. Bearish CRT
+    elif close_p < open_p:
+        # Close must be in the bottom % of the wick
+        if (close_p - low) <= (range_len * min_close_pos):
+            return "sell"
+            
+    return None
+
+def is_crt_pattern_mtf(m1_c2, m1_c3, htf_high, htf_low, min_momentum=0.25):
+    """
+    Multi-Timeframe CRT:
+    Detects if M1 candle triggers a reversal at HTF Structure (High/Low).
+    """
+    # Simple logic: Did we sweep the HTF level and close back inside?
+    
+    # Bearish Sweep (Sweep HTF High)
+    if m1_c3.high > htf_high and m1_c3.close < htf_high:
+        if m1_c3.close < m1_c3.open: # Bearish candle
+            return {
+                "pattern": "MTF_CRT_Bearish_Sweep", 
+                "side": "sell", 
+                "entry_trigger": m1_c3.close,
+                "sl": m1_c3.high,
+                "tp": m1_c3.close - (m1_c3.high - m1_c3.close) * 2
+            }
+
+    # Bullish Sweep (Sweep HTF Low)
+    if m1_c3.low < htf_low and m1_c3.close > htf_low:
+        if m1_c3.close > m1_c3.open: # Bullish candle
+            return {
+                "pattern": "MTF_CRT_Bullish_Sweep", 
+                "side": "buy", 
+                "entry_trigger": m1_c3.close,
+                "sl": m1_c3.low,
+                "tp": m1_c3.close + (m1_c3.close - m1_c3.low) * 2
+            }
+            
+    return None
