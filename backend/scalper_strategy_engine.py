@@ -342,7 +342,10 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
             confidence = float(sig.get('confidence', 0))
             side = sig['side']
             
-            if confidence < CONFIDENCE_THRESHOLD: continue
+            # Global Confidence Filter
+            if confidence < CONFIDENCE_THRESHOLD: 
+                send_info(f"⚠️ {symbol} REJECTED: {side} {sig.get('reason')} | Conf: {confidence:.2f} < {CONFIDENCE_THRESHOLD}")
+                continue
 
             # Conflict Handling
             if symbol in active_trades_virtual:
@@ -366,16 +369,21 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
                        f"Conf: {format_confidence_label(confidence)} | Lot: {final_lot}")
                 safe_telegram(msg)
             else:
-                if confidence >= MIN_CONF_FOR_TELEGRAM:
-                    msg = (f"📥 SIGNAL: {symbol} | {side.upper()} {sig.get('reason')}\n"
-                           f"Entry: {entry:.5f} | SL: {sl:.5f}\n"
-                           f"Conf: {format_confidence_label(confidence)}")
-                    safe_telegram(msg)
-
+                # ✅ FIX: Attempt order FIRST
                 res = place_order(symbol, side, final_lot, MAGIC, comment=strategy_mode, sl=sl, tp=tp)
                 
+                # ✅ FIX: Only alert if SUCCESS
                 if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                    if confidence >= MIN_CONF_FOR_TELEGRAM:
+                        msg = (f"📥 SIGNAL: {symbol} | {side.upper()} {sig.get('reason')}\n"
+                               f"Entry: {entry:.5f} | SL: {sl:.5f}\n"
+                               f"Conf: {format_confidence_label(confidence)}")
+                        safe_telegram(msg)
                     send_info(f"✅ {symbol} {side} Opened. Ticket: {res.order}")
+                
+                # ❌ Optional: Log failure (helps debug)
+                elif res:
+                    send_info(f"❌ {symbol} Order Failed: {res.comment} (Code: {res.retcode})")
 
     except Exception as e:
         send_info(f"Cycle Error {symbol}: {e}")

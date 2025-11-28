@@ -10,11 +10,11 @@ from zone_detector import detect_zones
 from trade_decision_engine import run_trade_decision_engine
 from scalper_strategy_engine import calculate_trend, get_htf_bias
 
-# --- SETTINGS ---
+
 SYMBOL = "XAUUSD"
 END_DATE = datetime.now()
-START_DATE = END_DATE - timedelta(days=30) # Test 30 days for speed
-CAPITAL = 1000.0
+START_DATE = END_DATE - timedelta(days=30) 
+CAPITAL = 100.0
 FIXED_LOT = 0.1
 
 def get_data(symbol, timeframe, start, end):
