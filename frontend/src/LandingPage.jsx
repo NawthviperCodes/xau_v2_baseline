@@ -25,22 +25,25 @@ const staggerContainer = {
   }
 };
 
-const floatAnimation = {
-  animate: {
-    y: [0, -15, 0],
-    transition: { duration: 6, repeat: Infinity, ease: "easeInOut" }
-  }
-};
+// --- Testimonials Data ---
+const TESTIMONIALS = [
+  { name: "Sarah K.", profit: "+$4,200", text: "I was skeptical about bots, but the Sniper Mode is scary accurate. The 14-day trial convinced me." },
+  { name: "David M.", profit: "+$12,500", text: "Finally a system that respects risk management. The daily circuit breaker saved me during NFP." },
+  { name: "Lerato P.", profit: "+$850", text: "Thabo's team is legit. The signals are clean, no repainting. Best investment for my small account." },
+];
 
 // --- Main Landing Page Component ---
 const LandingPage = ({ onAccessDashboard }) => {
-  const [contactStatus, setContactStatus] = useState('');
+  
+  // WhatsApp Integration Logic
+  const [formData, setFormData] = useState({ name: '', message: '' });
 
-  const handleContactSubmit = async (e) => {
+  const handleWhatsAppSubmit = (e) => {
     e.preventDefault();
-    setContactStatus('Sending...');
-    // ... (Keep existing logic here)
-    setTimeout(() => setContactStatus('Message sent!'), 1500); // Simulating success for UI demo
+    const phoneNumber = "27662297338"; // Thabo's Number (International Format without +)
+    const text = `Hi Nawthviper, my name is ${formData.name}. ${formData.message}`;
+    const url = `https://wa.me/${phoneNumber}?text=${encodeURIComponent(text)}`;
+    window.open(url, '_blank');
   };
 
   return (
@@ -48,15 +51,12 @@ const LandingPage = ({ onAccessDashboard }) => {
       
       {/* --- BACKGROUND FX --- */}
       <div className="fixed inset-0 z-0 pointer-events-none">
-        {/* Technical Grid Overlay */}
         <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:4rem_4rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)]"></div>
-        {/* Glow Orbs */}
         <div className="absolute top-[-10%] left-[-10%] w-[500px] h-[500px] bg-indigo-600/20 rounded-full blur-[120px]"></div>
-        <div className="absolute bottom-[-10%] right-[-10%] w-[500px] h-[500px] bg-purple-600/20 rounded-full blur-[120px]"></div>
       </div>
 
       {/* --- HEADER --- */}
-      <header className="fixed top-0 left-0 right-0 z-50 border-b border-white/5 bg-[#0B0F19]/80 backdrop-blur-md">
+      <header className="fixed top-0 left-0 right-0 z-50 border-b border-white/5 bg-[#0B0F19]/90 backdrop-blur-md">
         <nav className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
           <div className="flex items-center space-x-3 cursor-pointer">
             <LogoIcon />
@@ -74,10 +74,7 @@ const LandingPage = ({ onAccessDashboard }) => {
             ))}
           </div>
 
-          <button 
-            onClick={onAccessDashboard} 
-            className="hidden sm:block bg-white text-[#0B0F19] hover:bg-slate-200 text-sm font-bold py-2.5 px-6 rounded-lg transition-all shadow-[0_0_20px_rgba(255,255,255,0.1)] hover:shadow-[0_0_30px_rgba(255,255,255,0.2)]"
-          >
+          <button onClick={onAccessDashboard} className="hidden sm:block bg-white text-[#0B0F19] hover:bg-slate-200 text-sm font-bold py-2.5 px-6 rounded-lg transition-all shadow-lg hover:shadow-white/10">
             Launch App
           </button>
         </nav>
@@ -88,15 +85,13 @@ const LandingPage = ({ onAccessDashboard }) => {
         {/* --- HERO SECTION --- */}
         <section id="home" className="relative pt-32 pb-20 lg:pt-48 lg:pb-32 px-6">
           <div className="max-w-7xl mx-auto grid lg:grid-cols-2 gap-16 items-center">
-            
-            {/* Left: Text */}
             <motion.div initial="hidden" animate="visible" variants={staggerContainer} className="text-left">
               <motion.div variants={fadeInUp} className="inline-flex items-center space-x-2 bg-indigo-500/10 border border-indigo-500/20 rounded-full px-3 py-1 mb-8">
                 <span className="relative flex h-2 w-2">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                   <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                 </span>
-                <span className="text-xs font-medium text-indigo-300">V2.0 Engine Live</span>
+                <span className="text-xs font-medium text-indigo-300">V2.0 Sniper Engine Live</span>
               </motion.div>
               
               <motion.h1 variants={fadeInUp} className="text-5xl lg:text-7xl font-bold tracking-tight leading-[1.1] mb-6">
@@ -105,146 +100,198 @@ const LandingPage = ({ onAccessDashboard }) => {
               </motion.h1>
               
               <motion.p variants={fadeInUp} className="text-lg text-slate-400 mb-8 max-w-lg leading-relaxed">
-                Stop trading with emotion. Nawthviper connects directly to your MT5 terminal to execute institutional-grade strategies with mathematical discipline.
+                Execute institutional-grade strategies with mathematical discipline. The Nawthviper engine connects directly to your MT5 terminal for latency-free trading.
               </motion.p>
               
               <motion.div variants={fadeInUp} className="flex flex-col sm:flex-row gap-4">
-                <button onClick={onAccessDashboard} className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-4 px-8 rounded-xl transition-all shadow-lg shadow-indigo-600/25 flex items-center justify-center">
-                  Start Trading
-                  <svg className="w-4 h-4 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
-                </button>
-                <a href="#about" className="px-8 py-4 rounded-xl border border-slate-700 hover:bg-slate-800/50 text-slate-300 hover:text-white transition-all text-center">
-                  How it works
+                <a href="#pricing" className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-4 px-8 rounded-xl transition-all shadow-lg shadow-indigo-600/25 flex items-center justify-center">
+                  Start Free Trial
+                </a>
+                <a href="#services" className="px-8 py-4 rounded-xl border border-slate-700 hover:bg-slate-800/50 text-slate-300 hover:text-white transition-all text-center">
+                  Explore Features
                 </a>
               </motion.div>
             </motion.div>
 
-            {/* Right: Abstract UI Visualization (The "Unique" Part) */}
+            {/* Right: Feature Visualization */}
             <motion.div 
               initial={{ opacity: 0, x: 50 }} 
               animate={{ opacity: 1, x: 0 }} 
               transition={{ duration: 0.8, delay: 0.4 }}
               className="relative hidden lg:block"
             >
-              {/* Floating Glass Cards representing the Dashboard */}
-              <motion.div variants={floatAnimation} animate="animate" className="relative z-10">
-                {/* Card 1: Main Equity */}
-                <div className="absolute top-0 right-0 w-80 h-48 bg-slate-900/60 backdrop-blur-xl border border-slate-700/50 rounded-2xl p-6 shadow-2xl transform rotate-6 border-t-indigo-500/50">
-                   <div className="flex justify-between items-center mb-4">
-                      <div className="h-8 w-8 bg-indigo-500/20 rounded-lg flex items-center justify-center"><svg className="w-5 h-5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" /></svg></div>
-                      <span className="text-xs text-emerald-400 font-mono">+12.5%</span>
-                   </div>
-                   <div className="text-slate-400 text-sm mb-1">Total Equity</div>
-                   <div className="text-3xl font-bold text-white">$24,592.00</div>
-                   <div className="mt-4 h-1 w-full bg-slate-800 rounded-full overflow-hidden">
-                      <div className="h-full w-2/3 bg-gradient-to-r from-indigo-500 to-purple-500"></div>
-                   </div>
-                </div>
-
-                {/* Card 2: Active Trade */}
-                <div className="absolute top-32 right-48 w-64 bg-slate-800/80 backdrop-blur-xl border border-slate-600/50 rounded-2xl p-5 shadow-2xl transform -rotate-3 border-l-4 border-l-emerald-500">
-                   <div className="flex justify-between text-xs text-slate-400 mb-2">
-                      <span>GBP/USD</span>
-                      <span className="text-emerald-400">Running</span>
-                   </div>
-                   <div className="flex justify-between items-end">
-                      <div>
-                        <div className="text-lg font-bold">Buy 1.00</div>
-                        <div className="text-xs text-slate-500">@ 1.2450</div>
+               <div className="relative z-10 w-full max-w-md mx-auto">
+                  {/* Floating Terminal Window */}
+                  <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-700/50 rounded-2xl p-6 shadow-2xl">
+                      <div className="flex justify-between items-center mb-6 border-b border-white/5 pb-4">
+                          <div className="flex space-x-2">
+                              <div className="w-3 h-3 rounded-full bg-red-500"></div>
+                              <div className="w-3 h-3 rounded-full bg-yellow-500"></div>
+                              <div className="w-3 h-3 rounded-full bg-green-500"></div>
+                          </div>
+                          <div className="text-xs font-mono text-slate-500">XAUUSD [M5]</div>
                       </div>
-                      <div className="text-xl font-bold text-emerald-400">+$145.00</div>
-                   </div>
-                </div>
-              </motion.div>
-              
-              {/* Background Glow behind cards */}
-              <div className="absolute top-10 right-20 w-96 h-96 bg-indigo-500/30 rounded-full blur-[100px] pointer-events-none"></div>
+                      <div className="space-y-4">
+                          <div className="flex justify-between items-center">
+                              <div className="text-sm text-slate-400">Signal Confidence</div>
+                              <div className="text-sm text-emerald-400 font-bold">92.4%</div>
+                          </div>
+                          <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+                              <div className="h-full w-[92%] bg-emerald-500"></div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-4 mt-4">
+                              <div className="bg-slate-800/50 p-3 rounded-lg text-center">
+                                  <div className="text-xs text-slate-500">Entry</div>
+                                  <div className="font-mono text-white">2045.50</div>
+                              </div>
+                              <div className="bg-slate-800/50 p-3 rounded-lg text-center">
+                                  <div className="text-xs text-slate-500">Target</div>
+                                  <div className="font-mono text-emerald-400">2058.20</div>
+                              </div>
+                          </div>
+                      </div>
+                  </div>
+               </div>
+               <div className="absolute top-10 right-20 w-96 h-96 bg-indigo-500/20 rounded-full blur-[100px] pointer-events-none"></div>
             </motion.div>
           </div>
         </section>
 
-        {/* --- FEATURES (BENTO GRID) --- */}
-        <section id="services" className="py-24 relative">
-          <div className="max-w-7xl mx-auto px-6">
-            <motion.div initial="hidden" whileInView="visible" viewport={{ once: true }} variants={staggerContainer} className="mb-16">
-              <motion.h2 variants={fadeInUp} className="text-3xl md:text-5xl font-bold mb-6">Engineered for <span className="text-indigo-400">Profit.</span></motion.h2>
-              <div className="h-1 w-20 bg-indigo-500 rounded-full"></div>
-            </motion.div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 auto-rows-[minmax(180px,auto)]">
-              {/* Large Feature */}
-              <motion.div whileHover={{ y: -5 }} className="md:col-span-2 bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 rounded-3xl p-8 relative overflow-hidden group">
-                <div className="absolute top-0 right-0 w-64 h-64 bg-indigo-500/10 rounded-full blur-3xl group-hover:bg-indigo-500/20 transition-all duration-500"></div>
-                <h3 className="text-2xl font-bold mb-4 relative z-10">Low Latency Execution</h3>
-                <p className="text-slate-400 max-w-md relative z-10">Our Python-based engine processes market ticks in milliseconds. No repainting, no hesitation. Just pure logic execution directly to your broker.</p>
-                <div className="mt-8 flex gap-2">
-                   <span className="px-3 py-1 bg-slate-950/50 rounded-lg text-xs font-mono text-emerald-400 border border-emerald-500/20">0.4ms Ping</span>
-                   <span className="px-3 py-1 bg-slate-950/50 rounded-lg text-xs font-mono text-indigo-400 border border-indigo-500/20">MT5 Direct</span>
-                </div>
-              </motion.div>
-
-              {/* Tall Feature */}
-              <motion.div whileHover={{ y: -5 }} className="md:row-span-2 bg-slate-900 border border-slate-700/50 rounded-3xl p-8 flex flex-col justify-between group overflow-hidden">
-                <div className="absolute -bottom-10 -right-10 w-40 h-40 bg-purple-500/20 rounded-full blur-2xl group-hover:scale-150 transition-transform duration-700"></div>
+        {/* --- ABOUT US (FOUNDER) --- */}
+        <section id="about" className="py-24 bg-slate-900/30 border-y border-white/5">
+            <div className="max-w-7xl mx-auto px-6 grid md:grid-cols-2 gap-12 items-center">
                 <div>
-                   <div className="w-12 h-12 bg-purple-500/20 rounded-xl flex items-center justify-center mb-6 text-purple-400"><svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg></div>
-                   <h3 className="text-2xl font-bold mb-4">Capital Guard</h3>
-                   <p className="text-slate-400 text-sm leading-relaxed">Hard-coded risk limits protect your account from massive drawdowns. Set your daily loss limit and the bot kills the switch automatically.</p>
+                    <h2 className="text-3xl font-bold mb-6">Meet the Architect</h2>
+                    <p className="text-slate-400 mb-6 leading-relaxed">
+                        Nawthviper was engineered by <span className="text-white font-semibold">Thabo Gelson Masilopana</span>, a Computer Science graduate and Quantitative Software Developer.
+                    </p>
+                    <p className="text-slate-400 mb-8 leading-relaxed">
+                        Frustrated by retail trading indicators that lag and repaint, Thabo built a proprietary execution engine that trades purely on institutional logic: Order Blocks, Liquidity Sweeps, and Time/Price theory.
+                    </p>
+                    <div className="flex items-center space-x-4">
+                        <div className="px-4 py-2 bg-slate-800 rounded-lg text-sm border border-slate-700 text-slate-300">
+                            Computer Science Grad
+                        </div>
+                        <div className="px-4 py-2 bg-slate-800 rounded-lg text-sm border border-slate-700 text-slate-300">
+                            Quant Developer
+                        </div>
+                    </div>
                 </div>
-                <div className="mt-8 pt-8 border-t border-slate-800">
-                    <p className="text-xs font-mono text-slate-500">MAX_DRAWDOWN_LIMIT = TRUE</p>
+                
+                {/* Testimonials */}
+                <div className="space-y-4">
+                    {TESTIMONIALS.map((t, i) => (
+                        <div key={i} className="bg-slate-800/40 p-6 rounded-xl border border-white/5 backdrop-blur-sm">
+                            <div className="flex justify-between items-start mb-2">
+                                <span className="font-bold text-white">{t.name}</span>
+                                <span className="text-emerald-400 text-sm font-mono bg-emerald-500/10 px-2 py-1 rounded">{t.profit}</span>
+                            </div>
+                            <p className="text-slate-400 text-sm">"{t.text}"</p>
+                        </div>
+                    ))}
                 </div>
-              </motion.div>
-
-              {/* Standard Feature */}
-              <motion.div whileHover={{ y: -5 }} className="bg-slate-900 border border-slate-700/50 rounded-3xl p-8">
-                <h3 className="text-xl font-bold mb-2">Trend & Scalp Modes</h3>
-                <p className="text-sm text-slate-400">Switch between aggressive scalping for high volatility or safe trend-following for steady growth.</p>
-              </motion.div>
-
-              {/* Standard Feature */}
-              <motion.div whileHover={{ y: -5 }} className="bg-slate-900 border border-slate-700/50 rounded-3xl p-8">
-                 <h3 className="text-xl font-bold mb-2">Performance Analytics</h3>
-                 <p className="text-sm text-slate-400">Visualize your equity curve. Analyze wins vs losses to refine your edge.</p>
-              </motion.div>
             </div>
-          </div>
         </section>
 
-        {/* --- SIGNALS TEASER (NEW!) --- */}
-        <section id="signals" className="py-20 border-y border-white/5 bg-slate-900/30">
-           <div className="max-w-4xl mx-auto px-6 text-center">
-              <span className="text-emerald-400 font-mono text-sm tracking-widest uppercase">Coming Q1 2026</span>
-              <h2 className="text-3xl md:text-4xl font-bold mt-4 mb-6">Nawthviper Premium Signals</h2>
-              <p className="text-slate-400 text-lg mb-8">
-                 Don't want to run the bot? Receive our high-probability setups directly to your phone via Telegram or view them live on our upcoming Signals Dashboard.
-              </p>
-              <div className="flex justify-center space-x-4">
-                 <div className="px-6 py-3 bg-slate-800 rounded-lg border border-slate-700 flex items-center space-x-3 opacity-75">
-                    <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
-                    <span className="text-sm font-medium">Telegram Integration</span>
-                 </div>
-                 <div className="px-6 py-3 bg-slate-800 rounded-lg border border-slate-700 flex items-center space-x-3 opacity-75">
-                    <div className="w-2 h-2 bg-indigo-500 rounded-full animate-pulse"></div>
-                    <span className="text-sm font-medium">Web Terminal</span>
-                 </div>
-              </div>
-           </div>
+        {/* --- SERVICES & PRICING --- */}
+        <section id="pricing" className="py-24">
+            <div className="max-w-7xl mx-auto px-6">
+                <div className="text-center mb-16">
+                    <h2 className="text-3xl md:text-5xl font-bold mb-4">Choose Your Access</h2>
+                    <p className="text-slate-400">Institutional tools for retail traders.</p>
+                </div>
+
+                <div className="grid md:grid-cols-2 gap-8 max-w-4xl mx-auto">
+                    {/* Free Tier */}
+                    <div className="bg-slate-900 border border-slate-700 rounded-3xl p-8 hover:border-slate-500 transition-colors">
+                        <h3 className="text-xl font-bold text-white mb-2">Trial Access</h3>
+                        <div className="text-3xl font-bold text-white mb-6">Free <span className="text-sm font-normal text-slate-500">/ 14 Days</span></div>
+                        <ul className="space-y-4 mb-8 text-slate-400 text-sm">
+                            <li className="flex items-center"><span className="text-emerald-400 mr-2">✓</span> Access to Dashboard</li>
+                            <li className="flex items-center"><span className="text-emerald-400 mr-2">✓</span> XAUUSD Signals Only</li>
+                            <li className="flex items-center"><span className="text-emerald-400 mr-2">✓</span> Standard Execution Speed</li>
+                            <li className="flex items-center opacity-50"><span className="mr-2">✕</span> WhatsApp Alerts</li>
+                        </ul>
+                        <button onClick={onAccessDashboard} className="w-full py-4 rounded-xl border border-white/10 hover:bg-white/5 transition-all text-white font-semibold">
+                            Start Trial
+                        </button>
+                    </div>
+
+                    {/* Gold Tier */}
+                    <div className="bg-gradient-to-br from-indigo-900/40 to-slate-900 border border-indigo-500/50 rounded-3xl p-8 relative overflow-hidden">
+                        <div className="absolute top-0 right-0 bg-indigo-600 text-white text-xs font-bold px-3 py-1 rounded-bl-xl">POPULAR</div>
+                        <h3 className="text-xl font-bold text-white mb-2">Gold Tier</h3>
+                        <div className="text-3xl font-bold text-white mb-6">R500 <span className="text-sm font-normal text-slate-500">/ Month</span></div>
+                        <ul className="space-y-4 mb-8 text-slate-300 text-sm">
+                            <li className="flex items-center"><span className="text-emerald-400 mr-2">✓</span> Full Dashboard Access</li>
+                            <li className="flex items-center"><span className="text-emerald-400 mr-2">✓</span> All Assets (Indices + Forex)</li>
+                            <li className="flex items-center"><span className="text-emerald-400 mr-2">✓</span> Millisecond Latency</li>
+                            <li className="flex items-center"><span className="text-emerald-400 mr-2">✓</span> Direct WhatsApp Alerts</li>
+                        </ul>
+                        <button className="w-full py-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 transition-all text-white font-bold shadow-lg shadow-indigo-600/20">
+                            Upgrade Now
+                        </button>
+                    </div>
+                </div>
+            </div>
         </section>
 
-        {/* --- CONTACT FORM --- */}
+        {/* --- SIGNALS & FEATURES --- */}
+        <section id="signals" className="py-24 bg-slate-900/30 border-y border-white/5">
+            <div className="max-w-7xl mx-auto px-6">
+                <div className="grid md:grid-cols-3 gap-8 text-center">
+                    <div className="p-6">
+                        <div className="w-12 h-12 bg-emerald-500/10 rounded-xl flex items-center justify-center mx-auto mb-4 text-emerald-400">
+                            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                        </div>
+                        <h3 className="font-bold text-white mb-2">High Voltage</h3>
+                        <p className="text-sm text-slate-400">Optimized for NAS100, US30, and Gold volatility.</p>
+                    </div>
+                    <div className="p-6">
+                        <div className="w-12 h-12 bg-purple-500/10 rounded-xl flex items-center justify-center mx-auto mb-4 text-purple-400">
+                            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                        </div>
+                        <h3 className="font-bold text-white mb-2">Bank Security</h3>
+                        <p className="text-sm text-slate-400">Your broker details are encrypted. We never hold your funds.</p>
+                    </div>
+                    <div className="p-6">
+                        <div className="w-12 h-12 bg-blue-500/10 rounded-xl flex items-center justify-center mx-auto mb-4 text-blue-400">
+                            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                        </div>
+                        <h3 className="font-bold text-white mb-2">Live Analytics</h3>
+                        <p className="text-sm text-slate-400">Track equity growth and drawdowns in real-time.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        {/* --- CONTACT (WHATSAPP INTEGRATION) --- */}
         <section id="contact" className="py-24">
            <div className="max-w-xl mx-auto px-6">
               <div className="text-center mb-12">
-                 <h2 className="text-3xl font-bold">Start Your Journey</h2>
-                 <p className="text-slate-400 mt-2">Ready to automate? Send us a message.</p>
+                 <h2 className="text-3xl font-bold">Contact Support</h2>
+                 <p className="text-slate-400 mt-2">Questions about the bot? Chat directly with Thabo.</p>
               </div>
-              <form onSubmit={handleContactSubmit} className="space-y-4">
-                 <input type="text" name="name" placeholder="Name" required className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3.5 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none transition-all placeholder:text-slate-600" />
-                 <input type="email" name="email" placeholder="Email Address" required className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3.5 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none transition-all placeholder:text-slate-600" />
-                 <textarea name="message" rows="4" placeholder="How can we help?" required className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3.5 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none transition-all placeholder:text-slate-600"></textarea>
-                 <button type="submit" className="w-full bg-white text-slate-900 font-bold py-4 rounded-xl hover:bg-slate-200 transition-colors shadow-lg">
-                    {contactStatus || 'Send Message'}
+              <form onSubmit={handleWhatsAppSubmit} className="space-y-4">
+                 <input 
+                    type="text" 
+                    placeholder="Your Name" 
+                    required 
+                    value={formData.name}
+                    onChange={(e) => setFormData({...formData, name: e.target.value})}
+                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3.5 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none transition-all placeholder:text-slate-600" 
+                 />
+                 <textarea 
+                    rows="4" 
+                    placeholder="How can we help?" 
+                    required 
+                    value={formData.message}
+                    onChange={(e) => setFormData({...formData, message: e.target.value})}
+                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3.5 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none transition-all placeholder:text-slate-600"
+                 ></textarea>
+                 <button type="submit" className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-4 rounded-xl transition-colors shadow-lg flex items-center justify-center">
+                    <span className="mr-2">Send via WhatsApp</span>
+                    <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M.057 24l1.687-6.163c-1.041-1.804-1.588-3.849-1.587-5.946.003-6.556 5.338-11.891 11.893-11.891 3.181.001 6.167 1.24 8.413 3.488 2.245 2.248 3.481 5.236 3.48 8.414-.003 6.557-5.338 11.892-11.893 11.892-1.99-.001-3.951-.5-5.688-1.448l-6.305 1.654zm6.597-3.807c1.676.995 3.276 1.591 5.392 1.592 5.448 0 9.886-4.434 9.889-9.885.002-5.462-4.415-9.89-9.881-9.892-5.452 0-9.887 4.434-9.889 9.884-.001 2.225.651 3.891 1.746 5.634l-.999 3.648 3.742-.981zm11.387-5.464c-.074-.124-.272-.198-.57-.347-.297-.149-1.758-.868-2.031-.967-.272-.099-.47-.149-.669.149-.198.297-.768.967-.941 1.165-.173.198-.347.223-.644.074-.297-.149-1.255-.462-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.297-.347.446-.521.151-.172.2-.296.3-.495.099-.198.05-.372-.025-.521-.075-.148-.669-1.611-.916-2.206-.242-.579-.487-.501-.669-.51l-.57-.01c-.198 0-.52.074-.792.372s-1.04 1.016-1.04 2.479 1.065 2.876 1.213 3.074c.149.198 2.095 3.2 5.076 4.487.709.306 1.263.489 1.694.626.712.226 1.36.194 1.872.118.571-.085 1.758-.719 2.006-1.413.248-.695.248-1.29.173-1.414z"/></svg>
                  </button>
               </form>
            </div>
@@ -260,7 +307,7 @@ const LandingPage = ({ onAccessDashboard }) => {
               <span className="font-bold text-slate-300">Nawthviper</span>
            </div>
            <div className="text-slate-500 text-sm">
-              &copy; {new Date().getFullYear()} Nawthviper Systems. Designed for MT5.
+              &copy; {new Date().getFullYear()} Nawthviper Systems. Founder: Thabo Masilopana.
            </div>
         </div>
       </footer>

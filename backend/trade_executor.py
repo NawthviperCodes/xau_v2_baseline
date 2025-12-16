@@ -2,11 +2,16 @@
 import MetaTrader5 as mt5
 import time
 import threading
-from telegram_notifier import send_telegram_message
-from symbol_info_helper import get_lot_constraints
 
 # GLOBAL LOCK FOR ORDER SENDING
 EXECUTION_LOCK = threading.Lock()
+
+# ==========================================
+# === SAFE CONSTANTS (Prevents Crashes) ===
+# ==========================================
+# Some MT5 python versions miss these constants, so we define them safely.
+SYMBOL_FILLING_FOK = getattr(mt5, 'SYMBOL_FILLING_FOK', 1)
+SYMBOL_FILLING_IOC = getattr(mt5, 'SYMBOL_FILLING_IOC', 2)
 
 def get_position_by_ticket(ticket):
     try:
@@ -14,6 +19,26 @@ def get_position_by_ticket(ticket):
         if res: return res[0]
     except: pass
     return None
+
+def get_filling_mode(symbol):
+    """
+    Automatically determines the correct filling mode for the symbol/broker.
+    Many brokers reject IOC, so we fallback to FOK or RETURN.
+    """
+    info = mt5.symbol_info(symbol)
+    if not info:
+        return mt5.ORDER_FILLING_FOK  # Default fallback
+        
+    filling = info.filling_mode
+    
+    # Priority: FOK > IOC > RETURN
+    # We use the safe global constants defined above
+    if filling & SYMBOL_FILLING_FOK:
+        return mt5.ORDER_FILLING_FOK
+    elif filling & SYMBOL_FILLING_IOC:
+        return mt5.ORDER_FILLING_IOC
+    else:
+        return mt5.ORDER_FILLING_RETURN
 
 def close_partial_and_move_sl_to_be(ticket, partial_percent=0.5):
     with EXECUTION_LOCK:
@@ -52,31 +77,17 @@ def close_partial_and_move_sl_to_be(ticket, partial_percent=0.5):
         res = mt5.order_send(req_sl)
         return res.retcode == mt5.TRADE_RETCODE_DONE
 
-def get_filling_mode(symbol):
-    """
-    Automatically determines the correct filling mode for the symbol/broker.
-    Many brokers reject IOC, so we fallback to FOK or RETURN.
-    """
-    info = mt5.symbol_info(symbol)
-    if not info:
-        return mt5.ORDER_FILLING_FOK  # Default fallback
-        
-    filling = info.filling_mode
-    
-    # Priority: FOK > IOC > RETURN
-    if filling & mt5.SYMBOL_FILLING_FOK:
-        return mt5.ORDER_FILLING_FOK
-    elif filling & mt5.SYMBOL_FILLING_IOC:
-        return mt5.ORDER_FILLING_IOC
-    else:
-        return mt5.ORDER_FILLING_RETURN
-
 def place_order(symbol, side, lot, magic, comment="", sl=None, tp=None):
     with EXECUTION_LOCK:
-        if not mt5.initialize(): return None
+        # initialize check
+        if not mt5.initialize(): 
+            print(f"[Exec] MT5 Init Failed")
+            return None
         
         tick = mt5.symbol_info_tick(symbol)
-        if not tick: return None
+        if not tick: 
+            print(f"[Exec] No Tick Data for {symbol}")
+            return None
         
         type_op = mt5.ORDER_TYPE_BUY if side == 'buy' else mt5.ORDER_TYPE_SELL
         price = tick.ask if side == 'buy' else tick.bid
@@ -94,7 +105,7 @@ def place_order(symbol, side, lot, magic, comment="", sl=None, tp=None):
             "magic": magic,
             "comment": comment,
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": filling_type, # ✅ FIXED: Dynamic Filling Mode
+            "type_filling": filling_type, # ✅ FIXED: Safe Dynamic Filling Mode
         }
         
         if sl: request["sl"] = float(sl)
@@ -102,6 +113,10 @@ def place_order(symbol, side, lot, magic, comment="", sl=None, tp=None):
         
         result = mt5.order_send(request)
         
+        if result is None:
+            print(f"[Exec] Order Send returned None for {symbol}")
+            return None
+            
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             # Print specific error to console for debugging
             print(f"[Exec] ERROR placing {symbol}: {result.comment} (RetCode: {result.retcode})")
@@ -118,13 +133,16 @@ def modify_position_sltp(ticket, sl, tp):
             "tp": float(tp)
         }
         res = mt5.order_send(request)
+        if res is None: return False
         return res.retcode == mt5.TRADE_RETCODE_DONE
 
 def trail_sl(symbol, magic, trail_pips=150):
     positions = mt5.positions_get(symbol=symbol)
     if not positions: return
 
-    point = mt5.symbol_info(symbol).point
+    info = mt5.symbol_info(symbol)
+    if not info: return
+    point = info.point
     dist = trail_pips * point
     
     for pos in positions:
