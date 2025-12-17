@@ -4,6 +4,7 @@
 # 
 # ✅ FIX: Layer 2 Momentum Continuation (Trend Pullbacks)
 # ✅ SAFETY: "Panic Guard" to stop catching falling knives
+# ✅ SAFETY: Context-Aware ADR (Block Momentum, Allow Reversals)
 #
 
 from datetime import datetime
@@ -26,7 +27,8 @@ REJECTION_STATS = {
     "HTF Bias Conflict": 0,
     "Price Not In Zone": 0,
     "Trade Conflict": 0,
-    "Panic Guard Block": 0, # NEW STAT
+    "Panic Guard Block": 0, 
+    "ADR Block (Momentum)": 0, # 🚀 NEW STAT
     "Other": 0
 }
 
@@ -132,7 +134,8 @@ def run_trade_decision_engine(
     strategy_mode="trend_follow",
     macd=None, macd_signal=None, rsi=None, vwap=None, atr=None,htf_atr=None,
     m5_context=None, htf_high=None, htf_low=None, last_closed_h1=None, 
-    fibo_zone=None, bollinger_bands=None, htf_bias="NEUTRAL", thresholds={}
+    fibo_zone=None, bollinger_bands=None, htf_bias="NEUTRAL", thresholds={},
+    adr_pct=0.0 # 🚀 ADDED ADR INPUT
 ):
     signals = []
     T_CONF = thresholds.get('MIN_CONFIDENCE_FOR_TRADE', 0.60)
@@ -163,6 +166,7 @@ def run_trade_decision_engine(
                             "reason": crt_sig['pattern'],
                             "confidence": 0.95
                         })
+                        # NOTE: We do NOT check ADR here. Reversals are allowed at high ADR.
                         return signals, [] 
     except Exception:
         pass
@@ -218,6 +222,8 @@ def run_trade_decision_engine(
                 log_rejection("Panic Guard Block", zone_type, z_price, strategy_mode, trend)
                 REJECTION_STATS["Panic Guard Block"] += 1
                 continue # Skip this trade
+            
+            # NOTE: No ADR Check here. Trading FROM a zone is often a reversal/new leg.
 
             # Trade Construction
             entry_price = current_price
@@ -248,7 +254,7 @@ def run_trade_decision_engine(
             })
 
     # =================================================================
-    # === LAYER 2: MOMENTUM CONTINUATION (With Panic Guard) ===
+    # === LAYER 2: MOMENTUM CONTINUATION (With Panic Guard & ADR) ===
     # =================================================================
     if not signals and htf_bias != "NEUTRAL":
         L2_ATR_BUFFER = 0.5
@@ -256,6 +262,12 @@ def run_trade_decision_engine(
         L2_TP_RATIO = 1.25
         L2_CONFIDENCE = 0.68
         
+        # 🚀 ADR BLOCK FOR MOMENTUM ONLY
+        # If we have used up 85% of the daily range, don't chase trend
+        if adr_pct > 0.85:
+            REJECTION_STATS["ADR Block (Momentum)"] += 1
+            return signals, []
+
         if htf_bias == "UP" and trend == "uptrend":
             target_zones = fast_demand_zones; l2_side = "buy"
         elif htf_bias == "DOWN" and trend == "downtrend":

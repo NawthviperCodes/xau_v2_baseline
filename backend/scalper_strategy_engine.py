@@ -6,7 +6,7 @@
 # ✅ SAFETY 1: Daily Circuit Breaker (Stop after 2 losses)
 # ✅ SAFETY 2: Daily Candle Filter (Trend Alignment)
 # ✅ SAFETY 3: Time Session Filter (London/NY Only)
-# ✅ SAFETY 4: ADR Exhaustion Filter (Don't chase extended moves)
+# ✅ SAFETY 4: ADR Filter (Context Aware - No longer Global Block)
 #
 import MetaTrader5 as mt5
 import pandas as pd
@@ -84,7 +84,7 @@ DECISION_STATS = {
     "daily_filter_blocked": 0,
     "circuit_breaker_blocked": 0,
     "session_blocked": 0,      # New Stat
-    "adr_exhaustion_blocked": 0, # New Stat
+    "adr_exhaustion_blocked": 0, # Legacy Stat (Should stay 0 now)
     "signals_generated": 0,
     "signals_executed": 0,
 }
@@ -127,7 +127,7 @@ MAX_DAILY_CONSECUTIVE_LOSSES = 2 # SNIPER SETTING (Tighter leash)
 # SNIPER CONSTANTS
 SESSION_START_HOUR = 8  # London Open
 SESSION_END_HOUR = 20   # NY Close
-ADR_THRESHOLD_PCT = 0.85 # Stop trading if we hit 85% of average range
+# ADR_THRESHOLD_PCT = 0.85 # MOVED TO DECISION ENGINE LOGIC
 
 def get_symbol_spec(symbol):
     if symbol not in SYMBOL_SPECS:
@@ -211,15 +211,15 @@ def get_daily_candle_direction(symbol):
     except:
         return 'neutral'
 
-def check_adr_exhaustion(symbol, point):
+def get_adr_percentage(symbol):
     """
-    Checks if the daily range is already exhausted (>= 85% of ADR).
-    Returns True if exhausted (BLOCK TRADE).
+    Calculates how much of the ADR has been consumed today.
+    Returns: float (e.g., 0.85 for 85%)
     """
     try:
         # Get last 14 Daily candles for ADR calc
         rates_d1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 15)
-        if rates_d1 is None or len(rates_d1) < 14: return False # Not enough data
+        if rates_d1 is None or len(rates_d1) < 14: return 0.0 # Not enough data
         
         df_d1 = pd.DataFrame(rates_d1)
         # Calculate ATR(14) manually or approx
@@ -231,12 +231,10 @@ def check_adr_exhaustion(symbol, point):
         today = rates_d1[-1] # The last candle is the current unfinished daily candle
         current_range = today['high'] - today['low']
         
-        if current_range > (adr * ADR_THRESHOLD_PCT):
-            return True
-            
-        return False
+        if adr == 0: return 0.0
+        return current_range / adr
     except:
-        return False
+        return 0.0
 
 def check_session_time():
     """
@@ -277,13 +275,30 @@ def determine_lot_size(symbol, sl_price, entry_price, fixed_lot, strategy_mode):
         
         if dist == 0 or info.trade_tick_value == 0: return info.volume_min
         
+        # Calculate raw lots based on risk
         ticks = dist / info.trade_tick_size
         loss_per_lot = ticks * info.trade_tick_value
         if loss_per_lot <= 0: return info.volume_min
         
         lots = risk_amt / loss_per_lot
+        
+        # --- 🔧 FIX STARTS HERE 🔧 ---
         step = info.volume_step
+        
+        # 1. Quantize to step
         lots = round(lots / step) * step
+        
+        # 2. CLEAN THE FLOAT (Crucial Step)
+        # Calculate how many decimals the step has (e.g., 0.1 has 1, 0.01 has 2)
+        import math
+        decimals = 0
+        if step < 1:
+            decimals = int(math.ceil(-math.log10(step)))
+            
+        # Hard rounding to remove floating point noise like 0.1000000001
+        lots = round(lots, decimals)
+        # --- 🔧 FIX ENDS HERE 🔧 ---
+
         return max(info.volume_min, min(info.volume_max, lots))
     except:
         return info.volume_min
@@ -338,8 +353,8 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
         DECISION_STATS["cycles"] += 1
         
         # 1. Housekeeping
-        trail_sl(symbol, MAGIC) # Now properly imported
-        check_for_partial_tp_live(symbol) # Now properly defined
+        trail_sl(symbol, MAGIC) 
+        check_for_partial_tp_live(symbol) 
         
         if check_upcoming_high_impact(symbol):
             DECISION_STATS["news_blocked"] += 1
@@ -389,17 +404,16 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
             
         spec = get_symbol_spec(symbol)
 
-        # 4. ADR EXHAUSTION FILTER (New Sniper Logic)
-        if check_adr_exhaustion(symbol, spec.point):
-            DECISION_STATS["adr_exhaustion_blocked"] += 1
-            return
+        # 🚀 MODIFIED: 4. ADR CALCULATION (Passed to Engine, not blocking here)
+        adr_pct = get_adr_percentage(symbol)
+        # We removed the 'return' blocking logic here to allow reversals
 
         trend = calculate_trend(h1_df)
         
         # Heartbeat
         import random
         if random.random() < 0.05: 
-            send_info(f"👀 {symbol} Status | Bias: {htf_bias} | Zones: {len(demand_zones)}/{len(fast_demand)}")
+            send_info(f"👀 {symbol} Status | Bias: {htf_bias} | ADR: {adr_pct*100:.1f}%")
         
         m5_context = {
             'trend': calculate_trend(m5_df),
@@ -467,7 +481,8 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
             htf_low=h1_df['low'].min(),
             last_closed_h1=h1_df.iloc[-2],
             htf_bias=htf_bias,
-            thresholds=THRESHOLDS
+            thresholds=THRESHOLDS,
+            adr_pct=adr_pct # 🚀 PASSED ADR INTO ENGINE
         )
         if signals:
             DECISION_STATS["signals_generated"] += len(signals)
@@ -480,13 +495,13 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
             side = sig['side']
             
             # 5. DAILY FILTER (Red/Green Day)
-            daily_dir = get_daily_candle_direction(symbol)
-            if side == 'buy' and daily_dir == 'sell':
-                DECISION_STATS["daily_filter_blocked"] += 1
-                return 
-            if side == 'sell' and daily_dir == 'buy':
-                DECISION_STATS["daily_filter_blocked"] += 1
-                return 
+            #daily_dir = get_daily_candle_direction(symbol)
+           # if side == 'buy' and daily_dir == 'sell':
+           #     DECISION_STATS["daily_filter_blocked"] += 1
+           #     return 
+           # if side == 'sell' and daily_dir == 'buy':
+           #     DECISION_STATS["daily_filter_blocked"] += 1
+           #     return 
 
             if confidence >= CONFIDENCE_THRESHOLD: 
                 if symbol in active_trades_virtual:
