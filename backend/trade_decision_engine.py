@@ -4,7 +4,6 @@
 # 
 # ✅ FIX: Layer 2 Momentum Continuation (Trend Pullbacks)
 # ✅ SAFETY: "Panic Guard" to stop catching falling knives
-# ✅ SAFETY: Context-Aware ADR (Block Momentum, Allow Reversals)
 #
 
 from datetime import datetime
@@ -12,6 +11,7 @@ import pandas as pd
 import math
 import numpy as np
 from ta.volatility import AverageTrueRange
+from performance_tracker import get_pattern_weight, is_strategy_active
 
 # Import Pattern Recognition
 from candlestick_patterns import (
@@ -27,8 +27,7 @@ REJECTION_STATS = {
     "HTF Bias Conflict": 0,
     "Price Not In Zone": 0,
     "Trade Conflict": 0,
-    "Panic Guard Block": 0, 
-    "ADR Block (Momentum)": 0, # 🚀 NEW STAT
+    "Panic Guard Block": 0, # NEW STAT
     "Other": 0
 }
 
@@ -59,7 +58,7 @@ def is_panic_condition(candles, side):
     
     # 2. Check Last Candle Characteristics
     current_body = abs(last_c['close'] - last_c['open'])
-    is_huge = current_body > (avg_body * 2.0) # Candle is 2x larger than normal
+    is_huge = current_body > (avg_body * 1.5) # Tightened: 2.0 → 1.5 catches displacement earlier
     
     # 3. crash Logic
     if side == "buy":
@@ -75,6 +74,8 @@ def is_panic_condition(candles, side):
     return False
 
 def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=None, vwap=None, atr=None, htf_atr=None, m5_context=None):
+    # NOTE: macd, rsi, vwap params kept for API compatibility but no longer scored.
+    # Scoring is now: Pattern + M5 Context only.
     score = 0.0
     pattern_info = {"pattern": None, "side": None}
     
@@ -83,22 +84,37 @@ def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=Non
     c1, c2, c3 = candles.iloc[-3], candles.iloc[-2], candles.iloc[-1]
     
     # --- 1. Pattern Recognition ---
+    # Weights are adaptive: static defaults until 10 trades logged, then driven by real win rate.
     if is_bullish_engulfing(c2.open, c2.high, c2.low, c2.close, c3.open, c3.high, c3.low, c3.close):
-        score += 0.72; pattern_info = {"pattern": "bullish_engulfing", "side": "buy"}
+        pattern_info = {"pattern": "bullish_engulfing", "side": "buy"}
+        score += get_pattern_weight("bullish_engulfing", "zone_based")
     elif is_bearish_engulfing(c2.open, c2.high, c2.low, c2.close, c3.open, c3.high, c3.low, c3.close):
-        score += 0.72; pattern_info = {"pattern": "bearish_engulfing", "side": "sell"}
-    
+        pattern_info = {"pattern": "bearish_engulfing", "side": "sell"}
+        score += get_pattern_weight("bearish_engulfing", "zone_based")
+
     elif is_bullish_pin_bar(c3.open, c3.high, c3.low, c3.close):
-        score += 0.65; pattern_info = {"pattern": "bullish_pin_bar", "side": "buy"}
+        pattern_info = {"pattern": "bullish_pin_bar", "side": "buy"}
+        score += get_pattern_weight("bullish_pin_bar", "zone_based")
     elif is_bearish_pin_bar(c3.open, c3.high, c3.low, c3.close):
-        score += 0.65; pattern_info = {"pattern": "bearish_pin_bar", "side": "sell"}
+        pattern_info = {"pattern": "bearish_pin_bar", "side": "sell"}
+        score += get_pattern_weight("bearish_pin_bar", "zone_based")
 
     elif is_morning_star(c1, c2, c3):
-        score += 0.75; pattern_info = {"pattern": "morning_star", "side": "buy"}
+        pattern_info = {"pattern": "morning_star", "side": "buy"}
+        score += get_pattern_weight("morning_star", "zone_based")
     elif is_evening_star(c1, c2, c3):
-        score += 0.75; pattern_info = {"pattern": "evening_star", "side": "sell"}
+        pattern_info = {"pattern": "evening_star", "side": "sell"}
+        score += get_pattern_weight("evening_star", "zone_based")
 
     if not pattern_info["side"]: return 0.0, pattern_info
+
+    # 🧠 PATTERN KILL SWITCH — disabled per backtest evidence
+    # morning_star: 17% WR on XAUUSDz across 5 years (12 trades, -$2101)
+    # bearish_pin_bar: 0% WR (2 trades — small sample but consistent failure)
+    # To re-enable a pattern, remove it from this set and re-backtest.
+    DISABLED_PATTERNS = {"morning_star", "bearish_pin_bar"}
+    if pattern_info.get("pattern") in DISABLED_PATTERNS:
+        return 0.0, {"pattern": None, "side": None}
 
     # --- 2. Confluence Checks ---
     side = pattern_info["side"]
@@ -110,19 +126,6 @@ def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=Non
         elif (side == "buy" and m5_trend == "downtrend") or (side == "sell" and m5_trend == "uptrend"):
             score -= 0.15 
 
-    if macd is not None and macd_signal is not None:
-        if side == "buy" and macd > macd_signal: score += 0.05
-        if side == "sell" and macd < macd_signal: score += 0.05
-
-    if rsi is not None:
-        if side == "buy" and rsi > 50: score += 0.05
-        if side == "sell" and rsi < 50: score += 0.05
-
-    if vwap is not None:
-        last_price = c3.close
-        if side == "buy" and last_price > vwap: score += 0.05
-        if side == "sell" and last_price < vwap: score += 0.05
-    
     return min(1.0, score), pattern_info
 
 
@@ -166,7 +169,6 @@ def run_trade_decision_engine(
                             "reason": crt_sig['pattern'],
                             "confidence": 0.95
                         })
-                        # NOTE: We do NOT check ADR here. Reversals are allowed at high ADR.
                         return signals, [] 
     except Exception:
         pass
@@ -193,56 +195,91 @@ def run_trade_decision_engine(
 
             z_price = (zone_top + zone_bottom) / 2
             zone_width = abs(zone_top - zone_bottom)
+
+            # 🧠 ZONE STRENGTH FILTER — skip thin zones with no structure
+            atr_val_now = atr if (atr and not math.isnan(atr)) else (current_price * 0.0005)
+            if zone_width < atr_val_now * 0.5:
+                continue
+
+            # 🧠 STRUCTURE FILTER — zone must have between 1 and MAX_TOUCH_ALLOWED touches
+            # < 1 = untested, no edge proven yet
+            # > max = overused zone, institutional liquidity likely exhausted
+            zone_touches = zone.get("touches", 0)
+            max_touches  = thresholds.get("MAX_TOUCH_ALLOWED", 3)
+            if zone_touches < 1 or zone_touches > max_touches:
+                continue
+
             buffer = max(htf_atr * 0.5, zone_width * 0.25) if (htf_atr and not math.isnan(htf_atr)) else zone_width * 0.25
 
             in_zone = (zone_bottom - buffer) <= current_price <= (zone_top + buffer)
             REJECTION_STATS["Price Not In Zone"] += 1
 
             if not in_zone: continue
-            
             # Pattern Check
             confidence, p_info = compute_candlestick_confidence(
-                m5_candles_for_patterns, 
+                m5_candles_for_patterns,
                 macd=macd[-1] if macd is not None else None,
                 macd_signal=macd_signal[-1] if macd_signal is not None else None,
                 rsi=rsi[-1] if rsi is not None else None,
                 vwap=vwap, atr=atr, m5_context=m5_context
             )
-            
+
             if not p_info["side"] or p_info['side'] != desired_side:
                 log_rejection("Pattern Not Found", zone_type, z_price, strategy_mode, trend)
                 REJECTION_STATS["Pattern Not Found"] += 1; continue
-            
-            if confidence < T_CONF: 
+
+            if confidence < T_CONF:
                 log_rejection("Low Confidence", zone_type, z_price, strategy_mode, trend)
                 REJECTION_STATS["Low Confidence"] += 1; continue
-            
+
             # 🛡️ PANIC CHECK 🛡️
             if is_panic_condition(m5_candles_for_patterns, desired_side):
                 log_rejection("Panic Guard Block", zone_type, z_price, strategy_mode, trend)
                 REJECTION_STATS["Panic Guard Block"] += 1
-                continue # Skip this trade
-            
-            # NOTE: No ADR Check here. Trading FROM a zone is often a reversal/new leg.
+                continue
+
+            # 🧠 CONFIRMATION ENTRY — only enter AFTER candle confirms rejection
+            # Price must have already shown direction — not predictive guessing
+            if desired_side == "buy":
+                if c_last.close <= c_last.open:  # Need bullish close to confirm demand
+                    log_rejection("Pattern Not Found", zone_type, z_price, strategy_mode, trend)
+                    REJECTION_STATS["Pattern Not Found"] += 1; continue
+                entry_price = c_last.close
+            else:
+                if c_last.close >= c_last.open:  # Need bearish close to confirm supply
+                    log_rejection("Pattern Not Found", zone_type, z_price, strategy_mode, trend)
+                    REJECTION_STATS["Pattern Not Found"] += 1; continue
+                entry_price = c_last.close
 
             # Trade Construction
-            entry_price = current_price
             atr_val = atr if (atr and not math.isnan(atr)) else (current_price * 0.0005)
-            sl_dist = max(atr_val * 1.5, SL_BUFFER)
-            
+            sl_dist = max(atr_val * 1.0, SL_BUFFER)
+
             if desired_side == "buy":
-                sl = min(c_last.low, zone_bottom) - sl_dist
+                sl = zone_bottom - sl_dist
                 tp = entry_price + (abs(entry_price - sl) * TP_RATIO)
             else:
-                 sl = max(c_last.high, zone_top) + sl_dist
-                 tp = entry_price - (abs(entry_price - sl) * TP_RATIO)
-            
+                sl = zone_top + sl_dist
+                tp = entry_price - (abs(entry_price - sl) * TP_RATIO)
+
+            # 🧠 HARD RR FILTER — only asymmetric trades survive
+            # Confirmation entry can shrink TP distance — enforce minimum 1.3R
+            rr = abs(tp - entry_price) / abs(entry_price - sl) if abs(entry_price - sl) > 0 else 0
+            if rr < 1.3:
+                log_rejection("Low Confidence", zone_type, z_price, strategy_mode, trend)
+                REJECTION_STATS["Low Confidence"] += 1; continue
+
             conflict = False
             if active_trades and isinstance(active_trades, dict) and symbol in active_trades:
                 if active_trades[symbol]['side'] != desired_side: conflict = True
             if conflict:
                 log_rejection("Trade Conflict", zone_type, z_price, strategy_mode, trend)
                 REJECTION_STATS["Trade Conflict"] += 1; continue
+
+            # 🧠 KILL SWITCH: Skip if strategy is statistically underperforming
+            if not is_strategy_active(strategy_mode):
+                log_rejection("Other", zone_type, z_price, strategy_mode, trend)
+                REJECTION_STATS["Other"] += 1; continue
 
             signals.append({
                 "side": desired_side,
@@ -254,26 +291,34 @@ def run_trade_decision_engine(
             })
 
     # =================================================================
-    # === LAYER 2: MOMENTUM CONTINUATION (With Panic Guard & ADR) ===
+    # === LAYER 2: MOMENTUM CONTINUATION — DISABLED FOR BACKTESTING ===
     # =================================================================
-    if not signals and htf_bias != "NEUTRAL":
-        L2_ATR_BUFFER = 0.5
-        L2_SL_MULTIPLE = 1.0
-        L2_TP_RATIO = 1.25
-        L2_CONFIDENCE = 0.68
-        
-        # 🚀 ADR BLOCK FOR MOMENTUM ONLY
-        # If we have used up 85% of the daily range, don't chase trend
-        if adr_pct > 0.85:
-            REJECTION_STATS["ADR Block (Momentum)"] += 1
-            return signals, []
+    # L2 is disabled until zone-based strategy proves edge (PF > 1.2).
+    # L2 continuation trades hurt stress PF first — confirmed as a leak.
+    # Re-enable by removing the early return below once baseline edge exists.
+    if not signals:
+        return signals, []
 
+    # --- L2 code preserved below, not reached until re-enabled ---
+    if False and not signals and htf_bias != "NEUTRAL":
+        L2_ATR_BUFFER  = 0.5
+        L2_SL_MULTIPLE = 1.0
+        L2_TP_RATIO    = 1.8   # raised from 1.25 — low RR was killing this layer
+        L2_CONFIDENCE  = 0.68
+        
         if htf_bias == "UP" and trend == "uptrend":
             target_zones = fast_demand_zones; l2_side = "buy"
         elif htf_bias == "DOWN" and trend == "downtrend":
             target_zones = fast_supply_zones; l2_side = "sell"
         else:
             return signals, []
+
+        # 🧠 TRIPLE ALIGNMENT: M5 trend must also agree with L2 direction
+        # Without this, L2 chases price into trend exhaustion
+        if m5_context:
+            m5_trend = m5_context.get('trend')
+            if l2_side == "buy"  and m5_trend != "uptrend":   return signals, []
+            if l2_side == "sell" and m5_trend != "downtrend": return signals, []
 
         current_atr = atr if (atr and not math.isnan(atr)) else (current_price * 0.0005)
         
@@ -282,6 +327,13 @@ def run_trade_decision_engine(
             if not z_price: continue
 
             if abs(current_price - z_price) > (current_atr * L2_ATR_BUFFER): continue
+
+            # 🧠 ANTI-CHASE FILTER — skip if market already expanded
+            # If recent M5 range > 3x ATR, the move is exhausted — no edge left
+            if m5_candles_for_patterns is not None and len(m5_candles_for_patterns) >= 5:
+                recent_range = m5_candles_for_patterns['high'].max() - m5_candles_for_patterns['low'].min()
+                if recent_range > current_atr * 3:
+                    continue
 
             if vwap:
                 if l2_side == "buy" and current_price < vwap: continue 
@@ -295,7 +347,7 @@ def run_trade_decision_engine(
 
             if len(m1_candles_for_crt) >= 3:
                 c2, c3 = m1_candles_for_crt.iloc[-2], m1_candles_for_crt.iloc[-1]
-                p_info = is_crt_pattern_mtf(c2, c3, z_price, z_price, min_momentum=0.20)
+                p_info = is_crt_pattern_mtf(c2, c3, z_price, z_price, min_momentum=0.35)
                 
                 if p_info and p_info['side'] == l2_side:
                     sl_dist = current_atr * L2_SL_MULTIPLE

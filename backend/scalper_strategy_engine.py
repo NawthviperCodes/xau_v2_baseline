@@ -3,10 +3,16 @@
 # ======================================================
 # 
 # ✅ ARCHITECTURE: Thread-Safe Parallel Worker
+<<<<<<< HEAD
 # ✅ SAFETY 1: Daily Circuit Breaker (Stop after 2 losses)
 # ✅ SAFETY 2: Daily Candle Filter (Trend Alignment)
 # ✅ SAFETY 3: Time Session Filter (London/NY Only)
 # ✅ SAFETY 4: ADR Filter (Context Aware - No longer Global Block)
+=======
+# ✅ LOGIC: Smart Lot Sizing (User Override > Risk Fallback)
+# ✅ SAFETY 1: Daily Circuit Breaker (Stop after 3 losses)
+# ❌ REMOVED: Daily Candle Filter (was blocking valid zone reversals)
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
 #
 import MetaTrader5 as mt5
 import pandas as pd
@@ -43,6 +49,10 @@ from trade_decision_engine import (
     run_trade_decision_engine, 
     format_confidence_label
 )
+<<<<<<< HEAD
+=======
+from performance_tracker import get_dynamic_risk, detect_market_regime, print_performance_summary, log_trade
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
 from telegram_notifier import send_telegram_message
 
 # ============================
@@ -81,10 +91,15 @@ DECISION_STATS = {
     "price_not_in_zone": 0,
     "news_blocked": 0,
     "cooldown_blocked": 0,
+<<<<<<< HEAD
     "daily_filter_blocked": 0,
     "circuit_breaker_blocked": 0,
     "session_blocked": 0,      # New Stat
     "adr_exhaustion_blocked": 0, # Legacy Stat (Should stay 0 now)
+=======
+    "daily_filter_blocked": 0, # New Stat
+    "circuit_breaker_blocked": 0, # New Stat
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
     "signals_generated": 0,
     "signals_executed": 0,
 }
@@ -111,7 +126,13 @@ PARTIAL_CLOSE_PERCENT = CONFIG['StrategyParameters']['PARTIAL_CLOSE_PERCENT']
 AUTO_CLOSE_ON_STRONG = CONFIG['StrategyParameters']['AUTO_CLOSE_ON_STRONG']
 
 THRESHOLDS = CONFIG['StrategyParameters'].get('Thresholds', {})
+<<<<<<< HEAD
 CONFIDENCE_THRESHOLD = THRESHOLDS.get('MIN_CONFIDENCE_FOR_TRADE', 0.65) # UPDATED TO SNIPER LEVEL
+=======
+# Inject MAX_TOUCH_ALLOWED so decision engine can read it from the thresholds dict
+THRESHOLDS['MAX_TOUCH_ALLOWED'] = CONFIG['StrategyParameters'].get('MAX_TOUCH_ALLOWED', 2)
+CONFIDENCE_THRESHOLD = THRESHOLDS.get('MIN_CONFIDENCE_FOR_TRADE', 0.60)
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
 MIN_CONF_FOR_TELEGRAM = THRESHOLDS.get('MIN_CONF_FOR_TELEGRAM', 0.75)
 
 # ============================
@@ -122,12 +143,22 @@ SYMBOL_SPECS = {}
 tp1_hit_tickets = set()
 _last_closure_time = {} 
 COOLDOWN_MINUTES = 15
+<<<<<<< HEAD
 MAX_DAILY_CONSECUTIVE_LOSSES = 2 # SNIPER SETTING (Tighter leash)
 
 # SNIPER CONSTANTS
 SESSION_START_HOUR = 8  # London Open
 SESSION_END_HOUR = 20   # NY Close
 # ADR_THRESHOLD_PCT = 0.85 # MOVED TO DECISION ENGINE LOGIC
+=======
+MAX_DAILY_CONSECUTIVE_LOSSES = 3 # Hard Limit
+
+# 🧠 LEARNING LAYER STATE
+# Maps position ticket → original signal dict so we can log results when trade closes
+_pending_signals = {}
+# Tracks deal tickets already logged to prevent double-counting
+_logged_deal_tickets = set()
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
 
 def get_symbol_spec(symbol):
     if symbol not in SYMBOL_SPECS:
@@ -173,6 +204,7 @@ def get_htf_bias(df):
     if ema_fast < ema_slow: return "DOWN"
     return "NEUTRAL"
 
+<<<<<<< HEAD
 # --- 🛡️ SAFETY MODULES ---
 
 def check_daily_circuit_breaker(symbol):
@@ -252,6 +284,85 @@ def check_session_time():
         return True # Default to Open if time fetch fails
     except:
         return True 
+=======
+# --- 🛡️ SAFETY MODULE: CIRCUIT BREAKER ---
+def check_daily_circuit_breaker(symbol):
+    """
+    Checks if we have hit 3 consecutive losses TODAY.
+    Returns True if we should BLOCK trading.
+    """
+    try:
+        # Get history for today
+        now = datetime.now()
+        start_of_day = datetime(now.year, now.month, now.day)
+        
+        deals = mt5.history_deals_get(start_of_day, now, group=symbol)
+        if deals is None or len(deals) == 0:
+            return False
+            
+        consecutive_losses = 0
+        
+        # Iterate backwards (newest first)
+        for deal in reversed(deals):
+            if deal.magic != MAGIC: continue
+            if deal.entry != mt5.DEAL_ENTRY_OUT: continue # Only check exits
+            
+            profit = deal.profit
+            if profit < 0:
+                consecutive_losses += 1
+            elif profit > 0:
+                consecutive_losses = 0 # Reset on win
+                break # We are safe
+        
+        if consecutive_losses >= MAX_DAILY_CONSECUTIVE_LOSSES:
+            return True # BLOCK TRADING
+            
+        return False
+    except Exception as e:
+        print(f"Circuit Breaker Error: {e}")
+        return False
+
+
+# 🧠 LEARNING LAYER: Detect closed trades and feed results into performance memory
+def check_and_log_closed_trades(symbol):
+    """
+    Polls MT5 deal history for today. For each closed exit deal that matches
+    a signal we opened, logs the win/loss to trade_performance.json.
+
+    Called once per cycle — lightweight, uses today-only history window.
+    """
+    try:
+        now = datetime.now()
+        start_of_day = datetime(now.year, now.month, now.day)
+
+        deals = mt5.history_deals_get(start_of_day, now, group=symbol)
+        if not deals:
+            return
+
+        for deal in deals:
+            if deal.magic != MAGIC:               continue  # Not our bot
+            if deal.entry != mt5.DEAL_ENTRY_OUT:  continue  # Only exits
+            if deal.ticket in _logged_deal_tickets: continue  # Already logged
+
+            # Match deal back to the signal we stored at open time
+            position_ticket = deal.position_id
+            signal = _pending_signals.get(position_ticket)
+
+            if signal is None:
+                continue  # Trade not opened by this session — skip
+
+            result = "win" if deal.profit >= 0 else "loss"
+            log_trade(signal, result)
+
+            _logged_deal_tickets.add(deal.ticket)
+            _pending_signals.pop(position_ticket, None)  # Clean up memory
+
+            send_info(f"🧠 Logged: {symbol} {signal.get('reason')} "
+                      f"[{signal.get('strategy')}] → {result.upper()} (${deal.profit:.2f})")
+    except Exception as e:
+        send_info(f"[LogClosed] Error for {symbol}: {e}")
+
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
 
 def determine_lot_size(symbol, sl_price, entry_price, fixed_lot, strategy_mode):
     info = get_symbol_spec(symbol)
@@ -264,6 +375,14 @@ def determine_lot_size(symbol, sl_price, entry_price, fixed_lot, strategy_mode):
     if strategy_mode == "aggressive": risk_percent = 2.0
     elif strategy_mode == "conservative": risk_percent = 0.5
     elif strategy_mode == "momentum_continuation_L2": risk_percent = 0.4
+<<<<<<< HEAD
+=======
+    
+    # 🧠 ADAPTIVE: Scale risk up/down based on strategy's live win rate
+    # Neutral until 20 trades logged. Then: hot streak → 1.5x, cold → 0.5x
+    dynamic_multiplier = get_dynamic_risk(strategy_mode)
+    risk_percent = risk_percent * dynamic_multiplier
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
     
     try:
         acc = mt5.account_info()
@@ -275,14 +394,20 @@ def determine_lot_size(symbol, sl_price, entry_price, fixed_lot, strategy_mode):
         
         if dist == 0 or info.trade_tick_value == 0: return info.volume_min
         
+<<<<<<< HEAD
         # Calculate raw lots based on risk
+=======
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
         ticks = dist / info.trade_tick_size
         loss_per_lot = ticks * info.trade_tick_value
         if loss_per_lot <= 0: return info.volume_min
         
         lots = risk_amt / loss_per_lot
+<<<<<<< HEAD
         
         # --- 🔧 FIX STARTS HERE 🔧 ---
+=======
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
         step = info.volume_step
         
         # 1. Quantize to step
@@ -322,7 +447,10 @@ def check_for_partial_tp_live(symbol):
             is_buy = pos.type == mt5.ORDER_TYPE_BUY
             entry, sl = pos.price_open, pos.sl
             
+<<<<<<< HEAD
             # Check if already secured (SL moved to Entry)
+=======
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
             if (is_buy and sl >= entry) or (not is_buy and sl > 0 and sl <= entry):
                 tp1_hit_tickets.add(pos.ticket)
                 continue
@@ -351,15 +479,23 @@ def check_for_partial_tp_live(symbol):
 def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
     try:
         DECISION_STATS["cycles"] += 1
+<<<<<<< HEAD
         
         # 1. Housekeeping
         trail_sl(symbol, MAGIC) 
         check_for_partial_tp_live(symbol) 
         
+=======
+        trail_sl(symbol, MAGIC)
+        check_for_partial_tp_live(symbol)
+        check_and_log_closed_trades(symbol)  # 🧠 Log any newly closed trades
+        
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
         if check_upcoming_high_impact(symbol):
             DECISION_STATS["news_blocked"] += 1
             return
 
+<<<<<<< HEAD
         # 2. CIRCUIT BREAKER
         if check_daily_circuit_breaker(symbol):
             DECISION_STATS["circuit_breaker_blocked"] += 1
@@ -368,6 +504,14 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
         # 3. SESSION TIME FILTER (New Sniper Logic)
         if not check_session_time():
             DECISION_STATS["session_blocked"] += 1
+=======
+        # --- 🛡️ SAFETY CHECK 1: CIRCUIT BREAKER ---
+        if check_daily_circuit_breaker(symbol):
+            DECISION_STATS["circuit_breaker_blocked"] += 1
+            # Optional: Print only once per 100 cycles to avoid spam
+            if DECISION_STATS["cycles"] % 100 == 0:
+                send_info(f"⛔ {symbol} Circuit Breaker Active (3 Consecutive Losses). Sleeping.")
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
             return
 
         # Cooldown
@@ -401,6 +545,7 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
         if not demand_zones and not supply_zones and not fast_demand and not fast_supply:
             DECISION_STATS["no_zones_found"] += 1
             return
+<<<<<<< HEAD
             
         spec = get_symbol_spec(symbol)
 
@@ -414,6 +559,22 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
         import random
         if random.random() < 0.05: 
             send_info(f"👀 {symbol} Status | Bias: {htf_bias} | ADR: {adr_pct*100:.1f}%")
+=======
+
+        trend = calculate_trend(h1_df)
+        
+        # 🧠 REGIME DETECTION: Identify trending vs ranging market
+        # Ranging markets suppress L2 momentum trades — they need trending conditions
+        market_regime = detect_market_regime(h1_df)
+        effective_strategy = strategy_mode
+        if market_regime == "RANGING" and strategy_mode == "momentum_continuation_L2":
+            effective_strategy = "standard"  # Demote L2 to standard in choppy markets
+        
+        # Heartbeat
+        import random
+        if random.random() < 0.05: 
+            send_info(f"👀 {symbol} Status | Bias: {htf_bias} | Zones: {len(demand_zones)}/{len(fast_demand)}")
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
         
         m5_context = {
             'trend': calculate_trend(m5_df),
@@ -442,6 +603,24 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
                         'ticket': p.ticket
                     }
 
+<<<<<<< HEAD
+        
+        # Zone Touches
+        for z in demand_zones:
+            if abs(tick.bid - z["price"]) <= max(atr, 50 * spec.point):
+                ZONE_TOUCH_STATS["demand_touches"] += 1
+                break
+        else:
+            for z in supply_zones:
+                if abs(tick.bid - z["price"]) <= max(atr, 50 * spec.point):
+                    ZONE_TOUCH_STATS["supply_touches"] += 1
+                    break
+            else:
+                DECISION_STATS["price_not_in_zone"] += 1
+=======
+        # Decision Engine
+        spec = get_symbol_spec(symbol)
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
         
         # Zone Touches
         for z in demand_zones:
@@ -469,12 +648,16 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
             m5_candles_for_patterns=m5_df.iloc[-5:],
             active_trades=active_trades_virtual,
             zone_touch_counts={},
-            SL_BUFFER=150 * spec.point,
+            SL_BUFFER=60 * spec.point,
             TP_RATIO=TP_RATIO,
             CHECK_RANGE=max(atr, 50 * spec.point),
             LOT_SIZE=spec.volume_min, 
             MAGIC=MAGIC,
+<<<<<<< HEAD
             strategy_mode=strategy_mode, 
+=======
+            strategy_mode=effective_strategy, 
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
             macd=macd_line, macd_signal=macd_sig, rsi=rsi_val, vwap=vwap, atr=atr, htf_atr=h1_atr,
             m5_context=m5_context,
             htf_high=h1_df['high'].max(), 
@@ -494,6 +677,7 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
             confidence = float(sig.get('confidence', 0))
             side = sig['side']
             
+<<<<<<< HEAD
             # 5. DAILY FILTER (Red/Green Day)
             #daily_dir = get_daily_candle_direction(symbol)
            # if side == 'buy' and daily_dir == 'sell':
@@ -503,6 +687,8 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
            #     DECISION_STATS["daily_filter_blocked"] += 1
            #     return 
 
+=======
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
             if confidence >= CONFIDENCE_THRESHOLD: 
                 if symbol in active_trades_virtual:
                     existing = active_trades_virtual[symbol]
@@ -528,6 +714,10 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
                         
                         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
                             DECISION_STATS["signals_executed"] += 1
+<<<<<<< HEAD
+=======
+                            _pending_signals[res.order] = sig  # 🧠 Remember signal for result logging
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
                             if confidence >= MIN_CONF_FOR_TELEGRAM:
                                 msg = (f"📥 SIGNAL: {symbol} | {side.upper()} {sig.get('reason')}\n"
                                        f"Entry: {entry:.5f} | SL: {sl:.5f}\n"
@@ -540,6 +730,10 @@ def process_symbol_cycle(symbol, strategy_mode="standard", fixed_lot=None):
         if DECISION_STATS["cycles"] % 100 == 0:
             print_decision_summary()
             print_rejection_summary()
+<<<<<<< HEAD
+=======
+            print_performance_summary()
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
     
     except Exception as e:
         send_info(f"Cycle Error {symbol}: {e}")

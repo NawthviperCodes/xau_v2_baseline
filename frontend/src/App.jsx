@@ -8,6 +8,7 @@ import SignalsPage from './pages/SignalsPage';
 import ContactPage from './pages/ContactPage';
 import { Dashboard, LoginPage } from './DashboardPage';
 
+<<<<<<< HEAD
 // Scroll to top component for smooth page transitions
 const ScrollToTop = () => {
   const { pathname } = useLocation();
@@ -32,6 +33,26 @@ function App() {
     return savedUser ? JSON.parse(savedUser) : null;
   });
 
+=======
+const AppState = {
+  LANDING: 'LANDING',
+  LOGIN: 'LOGIN',
+  DASHBOARD: 'DASHBOARD',
+};
+
+function App() {
+  const [appState, setAppState] = useState(AppState.LANDING);
+  const [user, setUser] = useState(null);
+
+  const handleAccessDashboard = () => {
+    if (user) {
+      setAppState(AppState.DASHBOARD);
+    } else {
+      setAppState(AppState.LOGIN);
+    }
+  };
+  
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
   const handleLogin = (userData) => {
     setUser(userData);
     localStorage.setItem('nawth_user', JSON.stringify(userData));
@@ -39,6 +60,7 @@ function App() {
 
   const handleLogout = () => {
     setUser(null);
+<<<<<<< HEAD
     localStorage.removeItem('nawth_user');
   };
 
@@ -69,6 +91,28 @@ function App() {
       </Routes>
     </Router>
   );
+=======
+    setAppState(AppState.LANDING);
+  };
+
+  // NEW: Handler to go back to the landing page
+  const handleBackToLanding = () => {
+    setAppState(AppState.LANDING);
+  };
+
+  switch (appState) {
+    case AppState.LOGIN:
+      // Pass the new onBack prop here
+      return <LoginPage onLogin={handleLogin} onBack={handleBackToLanding} />;
+    
+    case AppState.DASHBOARD:
+      return <Dashboard user={user} onLogout={handleLogout} />;
+      
+    case AppState.LANDING:
+    default:
+      return <LandingPage onAccessDashboard={handleAccessDashboard} />;
+  }
+>>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
 }
 
 export default App;

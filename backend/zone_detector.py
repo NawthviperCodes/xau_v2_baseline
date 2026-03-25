@@ -50,23 +50,55 @@ def detect_zones(df, lookback=100, zone_size=5):
     for row in demand_rows:
         wick_low, body_top, t = row
         demand_zones.append({
-            "type": "demand",
-            "price": float(wick_low),
+            "type":   "demand",
+            "price":  float(wick_low),
             "bottom": float(wick_low),
-            "top": float(body_top),
-            "time": pd.to_datetime(t, unit='s')
+            "top":    float(body_top),
+            "time":   pd.to_datetime(t, unit='s'),
+            "touches": 0,  # populated below
         })
 
     supply_zones = []
     for row in supply_rows:
         wick_high, body_bottom, t = row
         supply_zones.append({
-            "type": "supply",
-            "price": float(wick_high),
-            "top": float(wick_high),
-            "bottom": float(body_bottom),
-            "time": pd.to_datetime(t, unit='s')
+            "type":    "supply",
+            "price":   float(wick_high),
+            "top":     float(wick_high),
+            "bottom":  float(body_bottom),
+            "time":    pd.to_datetime(t, unit='s'),
+            "touches": 0,  # populated below
         })
+
+    # --- Count touches: how many times price re-entered zone after formation ---
+    # A "touch" = candle low dips into demand zone (or high pokes into supply zone)
+    # This makes the zone strength filter in trade_decision_engine real and data-driven
+    close_arr = df['close'].values
+    low_arr   = df['low'].values
+    high_arr  = df['high'].values
+    time_arr  = df['time'].values
+
+    for zone in demand_zones:
+        zone_time = zone['time']
+        z_bot, z_top = zone['bottom'], zone['top']
+        count = 0
+        for idx in range(len(df)):
+            if df['time'].iloc[idx] <= zone_time:
+                continue  # only count touches AFTER zone formed
+            if low_arr[idx] <= z_top and high_arr[idx] >= z_bot:
+                count += 1
+        zone['touches'] = count
+
+    for zone in supply_zones:
+        zone_time = zone['time']
+        z_bot, z_top = zone['bottom'], zone['top']
+        count = 0
+        for idx in range(len(df)):
+            if df['time'].iloc[idx] <= zone_time:
+                continue
+            if high_arr[idx] >= z_bot and low_arr[idx] <= z_top:
+                count += 1
+        zone['touches'] = count
 
     return demand_zones, supply_zones
 
