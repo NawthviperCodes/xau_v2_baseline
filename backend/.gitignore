@@ -1,37 +1,45 @@
-.env
-*.pyc
+# Python
 __pycache__/
-# Python cache
-__pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
-
-# Virtual environment
-venv/
-.env/
-.venv/
-
-# Logs & data
 *.log
-*.csv
-*.json
+.python-version
+.venv/
+venv/
+env/
+ENV/
 
-# Trade history & performance reports
-rejected_signals_log.csv
-trades_history_local.csv
+# Environment files
+.env
+.env.*
+!.env.example
 
-# Jupyter & notebooks
-.ipynb_checkpoints/
+# Flask / Python caches
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
-# System files
+# Node / frontend
+node_modules/
+frontend/node_modules/
+dist/
+build/
+frontend/dist/
+frontend/build/
+
+# VS Code
+.vscode/
+
+# OS files
 .DS_Store
 Thumbs.db
 
-# MT5 specific
-*.ex5
-*.ex4
-*.mq5
-*.mq4
-MQL5/
-MQL4/
+# Local runtime / temporary files
+*.tmp
+*.temp
+
+# Optional: local bot artifacts
+
+*.sqlite3
