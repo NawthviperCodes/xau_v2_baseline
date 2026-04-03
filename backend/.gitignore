@@ -43,3 +43,13 @@ Thumbs.db
 # Optional: local bot artifacts
 
 *.sqlite3
+
+backtest_data/
+backtest_results/
+candlestick_research_results/
+reaction_research_results/
+stoploss_research_results/
+zone_research_results/
+config.json
+package-lock.json
+.gitignore_old
