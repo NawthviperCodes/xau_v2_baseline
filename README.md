@@ -3,6 +3,14 @@
   <img src="https://via.placeholder.com/1000x220.png?text=NawthViper+Currency+Bot" alt="NawthViper Banner"/>
 </p>
 
+Live demo:
+
+```text
+http://ajinvestment-thabo.southafricanorth.cloudapp.azure.com:8080/AJInvestment
+```
+
+[Open the  live demo](https://xau-v2-baseline.vercel.app/)
+
 <h1 align="center">💸 NawthViper Currency Bot</h1>
 <p align="center">Institutional-grade multi-timeframe automated trading system for MetaTrader 5</p>
 
