@@ -6,7 +6,7 @@
 Live demo:
 
 
-<h1 align = "center"> [Open the  live demo](https://xau-v2-baseline.vercel.app/) </h1>
+<p1 align = "center"> [Open the  live demo](https://xau-v2-baseline.vercel.app/) </p1>
 
 <h1 align="center">💸 NawthViper Currency Bot</h1>
 <p align="center">Institutional-grade multi-timeframe automated trading system for MetaTrader 5</p>
