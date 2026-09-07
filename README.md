@@ -8,7 +8,7 @@ Live demo:
 
 <p1 align = "center"> [Open the  live demo](https://xau-v2-baseline.vercel.app/) </p1>
 
-<h1 align="center">💸 NawthViper Currency Bot</h1>
+<h1 align="center"> NawthViper Currency Bot</h1>
 <p align="center">Institutional-grade multi-timeframe automated trading system for MetaTrader 5</p>
 
 <p align="center">
@@ -21,7 +21,7 @@ Live demo:
 
 ---
 
-## 🖼️ Preview / Dashboard Screenshots
+##  Preview / Dashboard Screenshots
 
 <p align="center">
   <img src="https://via.placeholder.com/800x400.png?text=Dashboard+Preview" width="80%" />
@@ -33,7 +33,7 @@ Live demo:
 
 ---
 
-## ⚙️ Overview
+##  Overview
 
 NawthViper Currency Bot is a professionally engineered trading engine designed for high-probability scalping using:
 
@@ -45,9 +45,9 @@ NawthViper Currency Bot is a professionally engineered trading engine designed f
 
 ---
 
-## 🚀 Key Features
+##  Key Features
 
-### 🧠 Strategy & Analysis
+###  Strategy & Analysis
 - **H4 EMA Bias (50/200)** – long-term trend control  
 - **H1 Supply/Demand Zones** using explosive departure logic  
 - **M5 Entry Confirmation** via Engulfing, Pin Bar, Morning/Evening Star  
@@ -56,7 +56,7 @@ NawthViper Currency Bot is a professionally engineered trading engine designed f
 
 ---
 
-### 🛡️ Risk & Trade Management
+###  Risk & Trade Management
 - Emergency Equity Control (Daily Loss / Total Drawdown)  
 - Live High-Impact News Filter (ForexFactory)  
 - Partial TP (1:1 RR) + Auto Breakeven  
@@ -65,7 +65,7 @@ NawthViper Currency Bot is a professionally engineered trading engine designed f
 
 ---
 
-### 🖥️ UI & System Architecture
+###  UI & System Architecture
 - Modern **React + Tailwind** dashboard  
 - Clean Telegram notifications  
 - Modular Python backend  
@@ -73,7 +73,7 @@ NawthViper Currency Bot is a professionally engineered trading engine designed f
 
 ---
 
-## 🧠 Tech Stack
+##  Tech Stack
 
 | Layer | Technology | Description |
 |------|------------|-------------|
@@ -86,7 +86,7 @@ NawthViper Currency Bot is a professionally engineered trading engine designed f
 
 ---
 
-## 📂 Project Structure
+##  Project Structure
 
 ```plaintext
 nawthviper_currency/
@@ -106,22 +106,22 @@ nawthviper_currency/
 ├── requirements.txt
 
 
-⚡ Installation
-1️⃣ Clone the Repository
+ Installation
+1️Clone the Repository
 git clone https://github.com/NawthviperCodes/currency_bot_v2.git
 cd currency_bot_v2
 
-2️⃣ Backend Setup
+2️Backend Setup
 cd backend
 pip install -r requirements.txt
 python main.py
 
-3️⃣ Frontend Setup
+3️ Frontend Setup
 cd ../frontend
 npm install
 npm start
 
-📌 Versioning
+ Versioning
 
 Current Stable Version: 2.0.0
 
@@ -134,15 +134,15 @@ v2.1.0 — New ATR trailing stop module
 
 v3.0.0 — Multi-symbol optimized threading & portfolio mode
 
-📝 License
+ License
 
 This project is licensed under the MIT License.
 
-🤝 Contributions
+ Contributions
 
 Contributions, pull requests, and feature suggestions are welcome.
 
-📩 Contact
+ Contact
 
 For issues or collaboration:
 NawthViperCodes – GitHub
